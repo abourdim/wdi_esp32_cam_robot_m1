@@ -1,0 +1,533 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32-CAM Robot Documentation</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f8fb;
+    --card: #ffffff;
+    --text: #172033;
+    --muted: #667085;
+    --border: #d7dce5;
+    --code: #0b1220;
+    --code-text: #e5e7eb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0b1220;
+      --card: #111827;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --border: #334155;
+      --code: #020617;
+      --code-text: #e2e8f0;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+  }
+  main {
+    width: min(1000px, calc(100% - 32px));
+    margin: 28px auto;
+    padding: clamp(20px, 4vw, 46px);
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 18px;
+  }
+  h1 { font-size: clamp(2rem, 5vw, 3.2rem); margin-top: 0; }
+  h2 {
+    margin-top: 2.2rem;
+    padding-top: .5rem;
+    border-top: 1px solid var(--border);
+  }
+  h3 { margin-top: 1.5rem; }
+  p, li { max-width: 85ch; }
+  code {
+    padding: .15em .35em;
+    border-radius: 5px;
+    background: color-mix(in srgb, var(--border) 45%, transparent);
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  }
+  pre {
+    overflow-x: auto;
+    padding: 14px 16px;
+    border-radius: 12px;
+    background: var(--code);
+    color: var(--code-text);
+  }
+  pre code { background: transparent; padding: 0; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0;
+  }
+  th, td {
+    padding: 9px 10px;
+    border: 1px solid var(--border);
+    text-align: left;
+  }
+  th { background: color-mix(in srgb, var(--border) 35%, transparent); }
+  .top {
+    color: var(--muted);
+    margin-bottom: 1.5rem;
+  }
+</style>
+</head>
+<body>
+<main>
+<div class="top">ESP32-CAM Robot — complete project reference</div>
+<h1>ESP32-CAM Robot</h1>
+
+<p>A Wi-Fi controlled ESP32-CAM robot with live camera streaming, independent motor PWM control, synchronized motor experiments, camera settings, Wi-Fi fallback AP mode, browser OTA firmware updates, debug/event logging, log export, and a UART0 USB serial console.</p>
+
+<h2>Current feature set</h2>
+
+<h3>Motor control</h3>
+
+<ul>
+<li>Left motor MOSFET gate: <strong>GPIO13</strong></li>
+<li>Right motor MOSFET gate: <strong>GPIO12</strong></li>
+<li>Full PWM range for each motor: <strong>0 to 255</strong></li>
+<li>Independent left/right speed sliders</li>
+<li>Exact <strong>-1 / +1</strong> PWM buttons</li>
+<li><strong>Sync motors</strong> checkbox:</li>
+</ul>
+<p>  - When enabled, changing either motor changes both motors to the same PWM value.</p>
+<p>  - Enabling Sync uses the current left motor value as the initial reference.</p>
+<ul>
+<li>Short full-power startup kick to help overcome motor stiction.</li>
+<li>Forward, left, right, and stop controls.</li>
+<li>Reverse is intentionally disabled because the present PCB uses one low-side MOSFET per motor rather than an H-bridge.</li>
+</ul>
+
+<p>At very low PWM values a motor may buzz without turning. This is useful for experiments because students can identify each motor&#x27;s real starting threshold. Do not leave a stalled motor powered for long periods.</p>
+
+<h2>Motor power hardware</h2>
+
+<p>The current PCB has one MOSFET per motor. Each MOSFET switches a motor in one direction only.</p>
+
+<p>Because the circuit is not an H-bridge:</p>
+
+<ul>
+<li>Forward: supported</li>
+<li>Left/right steering: supported by stopping one wheel</li>
+<li>Stop: supported</li>
+<li>Reverse: not supported</li>
+</ul>
+
+<p>For true bidirectional control, use an H-bridge such as a DRV8833 or TB6612FNG.</p>
+
+<h2>Camera</h2>
+
+<p>The ESP32-CAM serves an MJPEG stream on port <strong>81</strong>.</p>
+
+<p>The Settings sidebar provides:</p>
+
+<ul>
+<li>Resolution:</li>
+</ul>
+<p>  - QQVGA 160x120</p>
+<p>  - QVGA 320x240</p>
+<p>  - VGA 640x480</p>
+<p>  - SVGA 800x600</p>
+<p>  - XGA 1024x768</p>
+<p>  - SXGA 1280x1024</p>
+<p>  - UXGA 1600x1200</p>
+<ul>
+<li>Display rotation:</li>
+</ul>
+<p>  - 0 degrees</p>
+<p>  - 90 degrees clockwise</p>
+<p>  - 180 degrees</p>
+<p>  - 270 degrees clockwise</p>
+<ul>
+<li>JPEG quality</li>
+<li>Brightness</li>
+<li>Contrast</li>
+<li>Saturation</li>
+<li>Vertical flip</li>
+<li>Horizontal mirror</li>
+<li>Reset camera defaults</li>
+</ul>
+
+<p>High resolutions require PSRAM.</p>
+
+<h3>Rotation behavior</h3>
+
+<p>Vertical flip and horizontal mirror are sensor settings. They are applied by the camera.</p>
+
+<p>The 0/90/180/270 <strong>Display rotation</strong> setting rotates the stream in the browser. This avoids expensive real-time JPEG decoding, rotation, and re-encoding on the ESP32.</p>
+
+<p>The selected rotation is stored in the browser with <code>localStorage</code>, so it is remembered by that browser.</p>
+
+<h2>Web user interface</h2>
+
+<p>The robot page has two collapsible sidebars.</p>
+
+<h3>Left sidebar: Settings</h3>
+
+<p>Includes:</p>
+
+<ul>
+<li>Camera controls</li>
+<li>USB Serial console controls</li>
+<li>Serial baud selector</li>
+<li>Select port / Connect / Disconnect</li>
+<li>Live UART capture terminal</li>
+<li>Auto-scroll</li>
+<li>Clear capture</li>
+<li>Save capture</li>
+<li>Command entry</li>
+</ul>
+
+<h3>Right sidebar: Robot Debug</h3>
+
+<p>Shows:</p>
+
+<ul>
+<li>Motion state</li>
+<li>Left/right target PWM</li>
+<li>Left/right current output PWM</li>
+<li>Network mode</li>
+<li>Station status</li>
+<li>SSID</li>
+<li>Robot IP</li>
+<li>AP clients</li>
+<li>Wi-Fi RSSI</li>
+<li>Uptime</li>
+<li>Firmware build date/time</li>
+<li>Latest debug message</li>
+<li>64-event retained event history</li>
+<li>Export debug log</li>
+<li>Clear debug log</li>
+<li>Browser OTA firmware update</li>
+</ul>
+
+<p>Newest debug events are shown at the top.</p>
+
+<h2>UART0 / USB serial console</h2>
+
+<p>ESP32-CAM UART0:</p>
+
+<ul>
+<li>Baud: <strong>115200</strong></li>
+<li>Data bits: 8</li>
+<li>Parity: none</li>
+<li>Stop bits: 1</li>
+</ul>
+
+<h3>Wiring</h3>
+
+<table>
+<tr><th>ESP32-CAM</th><th>USB-TTL adapter</th></tr>
+<tr><td>U0T / GPIO1</td><td>RX</td></tr>
+<tr><td>U0R / GPIO3</td><td>TX</td></tr>
+<tr><td>GND</td><td>GND</td></tr>
+</table>
+
+<p>Use a <strong>3.3V TTL-compatible</strong> serial adapter. Do not connect RS-232 voltage levels directly to the ESP32.</p>
+
+<p>The console accepts:</p>
+
+<ul>
+<li><code>help</code></li>
+<li><code>status</code></li>
+<li><code>log</code></li>
+<li><code>camera</code></li>
+<li><code>stop</code></li>
+</ul>
+
+<p><code>stop</code> performs an emergency motor stop.</p>
+
+<h3>Browser Web Serial limitation</h3>
+
+<p>Chrome/Edge Web Serial requires a secure context. A page opened directly from:</p>
+
+<p><code>http://192.168.x.x</code></p>
+
+<p>is normally not considered a secure context, so direct COM-port access may be blocked even though the robot UI itself works.</p>
+
+<p>A standalone helper is included:</p>
+
+<p><code>ESP32_Robot_USB_Serial_Console.html</code></p>
+
+<p>For reliable Web Serial access, serve it from localhost:</p>
+
+<pre><code>
+python -m http.server 8000
+
+</code></pre>
+
+<p>Then open:</p>
+
+<p><code>http://localhost:8000/ESP32_Robot_USB_Serial_Console.html</code></p>
+
+<p>in Chrome or Edge.</p>
+
+<h2>Wi-Fi behavior</h2>
+
+<p>At boot the robot:</p>
+
+<ol>
+<li>1. Tries the configured Wi-Fi network for 10 seconds.</li>
+<li>2. If successful, it runs in normal STA mode.</li>
+<li>3. If it cannot connect, it creates its own fallback access point.</li>
+<li>4. While fallback AP mode is active, it periodically retries the configured Wi-Fi.</li>
+</ol>
+
+<h3>Fallback AP</h3>
+
+<ul>
+<li>SSID: <code>ESP32-Robot-XXXX</code></li>
+<li>Password: <code>88888888</code></li>
+<li>Default AP address: <code>http://192.168.4.1</code></li>
+</ul>
+
+<p><code>XXXX</code> is generated from part of the ESP32 chip ID so several classroom robots can have different SSIDs.</p>
+
+<p>If normal Wi-Fi works, the robot is usually reached at the DHCP address shown in the debug sidebar or UART console.</p>
+
+<h2>Debug event system</h2>
+
+<p>The ESP32 keeps the newest <strong>64 events</strong> in a circular buffer.</p>
+
+<p>Examples:</p>
+
+<ul>
+<li>Boot started</li>
+<li>Camera initialized</li>
+<li>Wi-Fi connection state</li>
+<li>Fallback AP start</li>
+<li>Motor commands</li>
+<li>PWM changes</li>
+<li>Camera settings</li>
+<li>OTA start/success/failure</li>
+<li>Serial emergency stop</li>
+</ul>
+
+<p>The browser requests only events newer than the last event ID it has seen.</p>
+
+<p>This prevents fast button events from being lost between status polls.</p>
+
+<h2>Export debug log</h2>
+
+<p>The Debug sidebar can save a <code>.txt</code> file containing:</p>
+
+<ul>
+<li>Current robot state</li>
+<li>PWM targets and outputs</li>
+<li>Network state</li>
+<li>SSID/IP</li>
+<li>Wi-Fi RSSI</li>
+<li>Uptime</li>
+<li>Build timestamp</li>
+<li>Latest message</li>
+<li>Event history, newest first</li>
+</ul>
+
+<p>The export uses Windows-friendly CRLF line endings and UTF-8 text.</p>
+
+<h2>OTA firmware update</h2>
+
+<p>The Debug sidebar contains a browser OTA uploader.</p>
+
+<p>OTA password:</p>
+
+<p><code>88888888</code></p>
+
+<p>Before OTA works, the ESP32 must be flashed once by USB using an OTA-capable partition scheme.</p>
+
+<p>A suitable Arduino IDE choice is typically:</p>
+
+<p><code>Minimal SPIFFS (1.9MB APP with OTA / 190KB SPIFFS)</code></p>
+
+<p>Exact wording may vary with the ESP32 Arduino core version.</p>
+
+<h3>OTA workflow</h3>
+
+<ol>
+<li>1. Compile the current sketch in Arduino IDE.</li>
+<li>2. Use <strong>Sketch -&gt; Export Compiled Binary</strong>.</li>
+<li>3. Select the main application file:</li>
+</ol>
+<p>   - <code>YourSketch.ino.bin</code></p>
+<ol>
+<li>4. Do not select:</li>
+</ol>
+<p>   - <code>*.bootloader.bin</code></p>
+<p>   - <code>*.partitions.bin</code></p>
+<p>   - <code>*.merged.bin</code></p>
+<ol>
+<li>5. Open the robot Debug sidebar.</li>
+<li>6. Enter OTA password <code>88888888</code>.</li>
+<li>7. Select the application <code>.ino.bin</code>.</li>
+<li>8. Upload.</li>
+<li>9. Motors are stopped before firmware writing.</li>
+<li>10. After a successful update, the ESP32 reboots.</li>
+</ol>
+
+<h2>Arduino sketch folder rule</h2>
+
+<p>This is important.</p>
+
+<p>Arduino compiles <strong>every <code>.ino</code> file in the same sketch folder</strong>.</p>
+
+<p>Do not put multiple complete versions of this robot firmware in the same directory.</p>
+
+<p>Correct:</p>
+
+<pre><code>
+ESP32_Robot_Complete/
+
+  ESP32_Robot_Complete.ino
+
+</code></pre>
+
+<p>Incorrect:</p>
+
+<pre><code>
+ESP32_Robot_Complete/
+
+  ESP32_Robot_Complete.ino
+
+  old_robot.ino
+
+  test_robot.ino
+
+</code></pre>
+
+<p>The incorrect layout causes errors such as:</p>
+
+<ul>
+<li>redefinition of <code>ssid</code></li>
+<li>redefinition of <code>setup()</code></li>
+<li>redefinition of <code>loop()</code></li>
+<li>redefinition of camera handlers</li>
+<li>redefinition of OTA variables</li>
+</ul>
+
+<p>Keep old firmware versions in separate folders or rename them to <code>.txt</code>.</p>
+
+<h2>Recommended Arduino settings</h2>
+
+<p>Typical settings for AI-Thinker ESP32-CAM:</p>
+
+<ul>
+<li>Board: AI Thinker ESP32-CAM</li>
+<li>Upload speed: 115200 if higher speeds are unreliable</li>
+<li>CPU frequency: 240 MHz</li>
+<li>Flash frequency: 40 MHz</li>
+<li>OTA-capable partition scheme</li>
+<li>Correct COM port</li>
+</ul>
+
+<p>For USB flashing, GPIO0 normally needs to be held low during boot, depending on the programmer/adapter arrangement.</p>
+
+<h2>Upload troubleshooting</h2>
+
+<p>If flashing connects at low speed and then fails after switching to a high baud rate, reduce <strong>Upload Speed</strong> to 115200.</p>
+
+<p>Disconnect or stop motors during firmware upload and use a stable 5V supply.</p>
+
+<h2>Network troubleshooting</h2>
+
+<p>If the robot cannot join configured Wi-Fi:</p>
+
+<ul>
+<li>Check SSID spelling</li>
+<li>Check password</li>
+<li>Check 2.4 GHz availability</li>
+<li>Check signal level</li>
+<li>Check router/AP security compatibility</li>
+</ul>
+
+<p>The debug log reports status such as:</p>
+
+<ul>
+<li>connected</li>
+<li>SSID not found</li>
+<li>connection/authentication failed</li>
+<li>connection lost</li>
+<li>disconnected</li>
+</ul>
+
+<p>If STA mode fails, connect directly to the fallback <code>ESP32-Robot-XXXX</code> network and open <code>192.168.4.1</code>.</p>
+
+<h2>Camera troubleshooting</h2>
+
+<p>If higher resolutions fail:</p>
+
+<ul>
+<li>Confirm PSRAM is detected.</li>
+<li>Try VGA or QVGA.</li>
+<li>Increase JPEG quality number to reduce image size.</li>
+<li>Check power stability.</li>
+<li>Lower resolution if the camera stream becomes slow.</li>
+</ul>
+
+<p>Remember: a lower JPEG quality number means higher image quality and generally larger JPEG frames.</p>
+
+<h2>Security notes</h2>
+
+<p>The current educational configuration uses <code>88888888</code> for:</p>
+
+<ul>
+<li>Fallback AP password</li>
+<li>OTA password</li>
+</ul>
+
+<p>This is convenient for a workshop/classroom but should be changed for an untrusted environment.</p>
+
+<p>The robot control page is HTTP, not HTTPS.</p>
+
+<p>Anyone who can reach the robot network may be able to control the robot unless additional authentication is added.</p>
+
+<h2>Main files</h2>
+
+<ul>
+<li><code>ESP32_Robot_Complete.ino</code> - complete ESP32-CAM robot firmware</li>
+<li><code>ESP32_Robot_USB_Serial_Console.html</code> - standalone localhost Web Serial terminal</li>
+<li><code>README.md</code> - this documentation</li>
+<li><code>README.html</code> - browser-friendly version of the documentation</li>
+</ul>
+
+<h2>Suggested classroom experiments</h2>
+
+<ul>
+<li>Find the minimum PWM where each unloaded wheel starts.</li>
+<li>Compare the left and right starting thresholds.</li>
+<li>Enable Sync and compare straight-line behavior.</li>
+<li>Intentionally offset one motor by 1-10 PWM counts and observe steering.</li>
+<li>Compare camera quality versus streaming responsiveness.</li>
+<li>Compare Wi-Fi RSSI with stream smoothness.</li>
+<li>Compare motor behavior with wheels lifted versus robot on the floor.</li>
+<li>Add encoders/Hall sensors later and compare requested PWM with actual RPM.</li>
+</ul>
+
+<h2>Future extensions</h2>
+
+<p>Useful next steps:</p>
+
+<ul>
+<li>Left/right wheel encoders</li>
+<li>Live RPM</li>
+<li>Wheel linear speed in m/s</li>
+<li>Distance estimation</li>
+<li>Closed-loop speed control</li>
+<li>Battery voltage monitoring</li>
+<li>H-bridge for reverse</li>
+<li>Saved Wi-Fi configuration from the browser</li>
+<li>Authentication for robot controls</li>
+<li>Downloadable CSV experiment data</li>
+</ul>
+</main>
+</body>
+</html>
