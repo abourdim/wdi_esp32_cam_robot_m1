@@ -60,7 +60,7 @@
 
 // Existing Wi-Fi configuration from your original sketch
 const char *ssid = "free_gazza";          // Set to your Wi-Fi name
-const char *password = "err_Safia080707";  // Set to your Wi-Fi passwords
+const char *password = "Safia080707";  // Set to your Wi-Fi passwords
 
 // Wi-Fi fallback configuration
 // If the configured Wi-Fi cannot be reached within 10 seconds, the robot
@@ -111,13 +111,6 @@ static const int LED_MIN_PWM = 0;
 static const int LED_MAX_PWM = 255;
 volatile int ledBrightness = 255;
 volatile bool ledEnabled = false;
-
-// Boot indicator: three short flashes at 5% of the 8-bit range. GPIO4 is the
-// module's own flash LED and is genuinely painful to look at near full scale,
-// which matters for something that fires on every boot.
-static const int LED_BOOT_BLINK_PWM = 13;  // 5% of 255
-static const int LED_BOOT_BLINK_COUNT = 3;
-static const int LED_BOOT_BLINK_MS = 120;
 
 // UART0 / USB-TTL console pins
 #define SERIAL_RX_PIN 3   // U0R
@@ -685,18 +678,6 @@ void setup() {
   ledEnabled = false;
   ledBrightness = 255;
   applyLedOutput();
-
-  // Three flashes, before Serial is even up: the earliest sign the CPU is
-  // actually running. Worth having on a board whose only other way of saying
-  // anything is a serial cable -- if the flashes appear, the ESP32 booted and
-  // whatever comes next is a software problem rather than a dead board.
-  for (int i = 0; i < LED_BOOT_BLINK_COUNT; i++) {
-    analogWrite(LED_GPIO_NUM, LED_BOOT_BLINK_PWM);
-    delay(LED_BOOT_BLINK_MS);
-    analogWrite(LED_GPIO_NUM, 0);
-    delay(LED_BOOT_BLINK_MS);
-  }
-  applyLedOutput();  // back to the configured state (off)
 
   Serial.begin(SERIAL_BAUD, SERIAL_8N1, SERIAL_RX_PIN, SERIAL_TX_PIN);
   Serial.setDebugOutput(false);
