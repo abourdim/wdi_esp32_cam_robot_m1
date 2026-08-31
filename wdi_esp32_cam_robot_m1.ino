@@ -57,6 +57,7 @@
 #include "soc/rtc_cntl_reg.h"
 #include "esp_http_server.h"
 #include "esp_wifi.h"
+#include <Preferences.h>
 #include <Update.h>
 
 // Gzipped copy of the INDEX_HTML literal further down this file,
@@ -64,8 +65,19 @@
 #include "index_html_gz.h"
 
 // Existing Wi-Fi configuration from your original sketch
-const char *ssid = "free_gazza";          // Set to your Wi-Fi name
-const char *password = "err_Safia080707";  // Set to your Wi-Fi passwords
+// Compiled-in defaults. They are only used the first time: once a network is
+// chosen in Settings the pair is stored in NVS and these are ignored, so a
+// robot can move between a workshop and a classroom without being reflashed.
+static const char *DEFAULT_SSID = "free_gazza";
+static const char *DEFAULT_PASSWORD = "err_Safia080707";
+
+static char ssid[33] = "free_gazza";
+static char password[65] = "err_Safia080707";
+
+// Set by the Wi-Fi handler and acted on in loop(), rather than inside the
+// request: joining a network moves the radio off the AP's channel, which
+// would kill the very connection the reply has to travel over.
+static volatile bool wifiApplyRequested = false;
 
 // Wi-Fi fallback configuration
 // If the configured Wi-Fi cannot be reached within 10 seconds, the robot
@@ -85,6 +97,31 @@ static const uint32_t WIFI_RETRY_MAX_INTERVAL_MS = 300000;
 // that never fired the release event -- leaves a wheel turning until some
 // later command happens to get through.
 static const uint32_t MOTION_TIMEOUT_MS = 600;
+
+// Saved settings
+// Camera tuning, motor speeds and LED brightness belong to the robot, not to
+// whichever browser last connected: two viewers would otherwise restore two
+// different sets of values and fight over them. They live in NVS and come
+// back at boot.
+//
+// Writes wait for the sliders to settle. The camera and motor controls send
+// on every input event, and committing flash at that rate would be hundreds
+// of writes for one drag of a slider.
+static Preferences settingsStore;
+static const char *SETTINGS_NAMESPACE = "robot";
+static const uint32_t SETTINGS_SAVE_DELAY_MS = 4000;
+
+static bool settingsDirty = false;
+static unsigned long settingsChangedMs = 0;
+
+// A name the class gives the robot. Eight identical boards in a room are
+// only telling apart by this and the fallback AP suffix.
+static char robotName[33] = "ESP32-CAM Robot";
+
+static void noteSettingsChanged() {
+  settingsDirty = true;
+  settingsChangedMs = millis();
+}
 
 // Browser OTA firmware update
 // NOTE: The board must be flashed once by USB using an OTA-capable partition
@@ -179,6 +216,15 @@ bool cameraHasPsram = false;
 // Full 8-bit PWM range is intentionally exposed for experimentation.
 static const int MIN_PWM = 0;
 static const int MAX_PWM = 255;
+
+// Teacher's ceiling on motor PWM. Enforced here rather than in the browser,
+// so it holds however the command arrives.
+static int maxMotorPWM = MAX_PWM;
+
+// Measured starting PWM of each motor, 0 when nobody has looked yet.
+static int leftThreshold = 0;
+static int rightThreshold = 0;
+
 static const int START_KICK_MS = 120;  // brief boost when starting a motor from rest
 
 volatile int leftMotorSpeed = 220;
@@ -483,7 +529,7 @@ static void checkIndexGzAsset();
 
 static int clampMotorPWM(int value) {
   if (value < MIN_PWM) return MIN_PWM;
-  if (value > MAX_PWM) return MAX_PWM;
+  if (value > maxMotorPWM) return maxMotorPWM;
   return value;
 }
 
@@ -601,8 +647,8 @@ static void writeMotors(int leftPWM, int rightPWM) {
   bool kickRight = (currentRightPWM == 0 && rightPWM > 0);
 
   if (kickLeft || kickRight) {
-    analogWrite(MOTOR_L_PIN, kickLeft ? MAX_PWM : leftPWM);
-    analogWrite(MOTOR_R_PIN, kickRight ? MAX_PWM : rightPWM);
+    analogWrite(MOTOR_L_PIN, kickLeft ? maxMotorPWM : leftPWM);
+    analogWrite(MOTOR_R_PIN, kickRight ? maxMotorPWM : rightPWM);
     delay(START_KICK_MS);
   }
 
@@ -678,6 +724,36 @@ static void commandStop() {
   stopMotors();
 }
 
+// Joining the chosen network. Called from loop() so the reply to the request
+// that asked for it is already sent and gone.
+static void serviceWifiApply() {
+  if (!wifiApplyRequested) return;
+  wifiApplyRequested = false;
+
+  char dbg[96];
+  snprintf(dbg, sizeof(dbg), "NET: Connecting to %s", ssid);
+  setDebugMessage(dbg);
+
+  // Keep the access point up throughout, so a failed attempt cannot strand
+  // anyone outside the robot.
+  if (!fallbackApActive) {
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.setSleep(false);
+    startFallbackAccessPoint();
+  }
+
+  WiFi.disconnect();
+  delay(100);
+  WiFi.begin(ssid, password);
+
+  lastWiFiRetryMs = millis();
+  wifiRetryIntervalMs = WIFI_RETRY_INTERVAL_MS;
+
+  // The person asked for this one, so it is not subject to the rule that
+  // pauses retries while somebody is using the AP.
+  wifiRetryPaused = false;
+}
+
 // The dead man's switch. Nothing the browser, the network, or the person
 // holding the phone can do should be able to leave a motor running.
 static void serviceMotionTimeout() {
@@ -731,6 +807,145 @@ static bool frameSizeNeedsPsram(framesize_t frameSize) {
          frameSize == FRAMESIZE_XGA ||
          frameSize == FRAMESIZE_SXGA ||
          frameSize == FRAMESIZE_UXGA;
+}
+
+// Writes every saved setting in one pass. NVS skips a write when the stored
+// value already matches, so an unchanged field costs nothing.
+static void saveSettings() {
+  sensor_t *sensor = esp_camera_sensor_get();
+
+  if (!settingsStore.begin(SETTINGS_NAMESPACE, false)) {
+    setDebugMessage("WARN: Could not open settings storage");
+    return;
+  }
+
+  settingsStore.putString("name", robotName);
+  settingsStore.putString("wifiSsid", ssid);
+  settingsStore.putString("wifiPass", password);
+  settingsStore.putInt("maxPwm", maxMotorPWM);
+  settingsStore.putInt("leftThresh", leftThreshold);
+  settingsStore.putInt("rightThresh", rightThreshold);
+  settingsStore.putInt("leftSpeed", leftMotorSpeed);
+  settingsStore.putInt("rightSpeed", rightMotorSpeed);
+  settingsStore.putInt("ledBright", ledBrightness);
+  settingsStore.putBool("ledOn", ledEnabled);
+
+  if (sensor) {
+    settingsStore.putInt("frameSize", (int)sensor->status.framesize);
+    settingsStore.putInt("quality", (int)sensor->status.quality);
+    settingsStore.putInt("brightness", (int)sensor->status.brightness);
+    settingsStore.putInt("contrast", (int)sensor->status.contrast);
+    settingsStore.putInt("saturation", (int)sensor->status.saturation);
+    settingsStore.putBool("vflip", sensor->status.vflip != 0);
+    settingsStore.putBool("hmirror", sensor->status.hmirror != 0);
+  }
+
+  settingsStore.end();
+  setDebugMessage("SETTINGS: Saved to flash");
+}
+
+static void serviceSettingsSave() {
+  if (!settingsDirty) return;
+  if (millis() - settingsChangedMs < SETTINGS_SAVE_DELAY_MS) return;
+
+  settingsDirty = false;
+  saveSettings();
+}
+
+// Restores motor and LED values. Called before the camera exists, so the
+// sensor half is separate.
+static void loadMotorAndLedSettings() {
+  if (!settingsStore.begin(SETTINGS_NAMESPACE, true)) return;
+
+  String savedName = settingsStore.getString("name", robotName);
+  savedName.toCharArray(robotName, sizeof(robotName));
+
+  String savedSsid = settingsStore.getString("wifiSsid", DEFAULT_SSID);
+  String savedPass = settingsStore.getString("wifiPass", DEFAULT_PASSWORD);
+
+  if (savedSsid.length() > 0) {
+    savedSsid.toCharArray(ssid, sizeof(ssid));
+    savedPass.toCharArray(password, sizeof(password));
+  }
+
+  maxMotorPWM = settingsStore.getInt("maxPwm", maxMotorPWM);
+  if (maxMotorPWM < 1 || maxMotorPWM > MAX_PWM) maxMotorPWM = MAX_PWM;
+
+  leftThreshold = settingsStore.getInt("leftThresh", 0);
+  rightThreshold = settingsStore.getInt("rightThresh", 0);
+
+  leftMotorSpeed = clampMotorPWM(settingsStore.getInt("leftSpeed", leftMotorSpeed));
+  rightMotorSpeed = clampMotorPWM(settingsStore.getInt("rightSpeed", rightMotorSpeed));
+  ledBrightness = clampLedPWM(settingsStore.getInt("ledBright", ledBrightness));
+  ledEnabled = settingsStore.getBool("ledOn", ledEnabled);
+
+  settingsStore.end();
+
+  char dbg[96];
+  snprintf(
+    dbg,
+    sizeof(dbg),
+    "SETTINGS: Restored motors %d/%d, LED %s %d",
+    leftMotorSpeed,
+    rightMotorSpeed,
+    ledEnabled ? "on" : "off",
+    ledBrightness
+  );
+  setDebugMessage(dbg);
+}
+
+static void loadCameraSettings() {
+  sensor_t *sensor = esp_camera_sensor_get();
+  if (!sensor) return;
+
+  if (!settingsStore.begin(SETTINGS_NAMESPACE, true)) return;
+
+  int frameSize = settingsStore.getInt("frameSize", -1);
+  int quality = settingsStore.getInt("quality", -1);
+  int brightness = settingsStore.getInt("brightness", 0);
+  int contrast = settingsStore.getInt("contrast", 0);
+  int saturation = settingsStore.getInt("saturation", 0);
+  bool vflip = settingsStore.getBool("vflip", Video_Flip);
+  bool hmirror = settingsStore.getBool("hmirror", false);
+
+  settingsStore.end();
+
+  // A resolution saved on a board with PSRAM must not be restored onto one
+  // without it; the allocation would fail and take the stream with it.
+  if (frameSize >= 0 &&
+      !(frameSizeNeedsPsram((framesize_t)frameSize) && !cameraHasPsram)) {
+    sensor->set_framesize(sensor, (framesize_t)frameSize);
+  }
+
+  if (quality >= 0) sensor->set_quality(sensor, quality);
+
+  sensor->set_brightness(sensor, brightness);
+  sensor->set_contrast(sensor, contrast);
+  sensor->set_saturation(sensor, saturation);
+  sensor->set_vflip(sensor, vflip ? 1 : 0);
+  sensor->set_hmirror(sensor, hmirror ? 1 : 0);
+
+  char dbg[96];
+  snprintf(
+    dbg,
+    sizeof(dbg),
+    "SETTINGS: Restored camera %s / quality %d",
+    frameSizeName(sensor->status.framesize),
+    (int)sensor->status.quality
+  );
+  setDebugMessage(dbg);
+}
+
+// Recorded programs. Keeping them on the robot rather than in one browser
+// means the program follows the robot round the classroom.
+static const size_t PROGRAM_SLOT_MAX = 2048;
+
+static bool programSlotKey(const char *slot, char *out, size_t outLen) {
+  if (!slot || !out) return false;
+  if (slot[0] < '1' || slot[0] > '3' || slot[1] != '\0') return false;
+
+  snprintf(out, outLen, "prog%c", slot[0]);
+  return true;
 }
 
 static void printSerialCameraStatus() {
@@ -942,6 +1157,9 @@ void setup() {
   setDebugMessage("BOOT: Motor outputs initialized and stopped");
   setDebugMessage("BOOT: Flash LED initialized OFF; brightness 255 / 255");
 
+  loadMotorAndLedSettings();
+  applyLedOutput();
+
   // Camera configuration
   setDebugMessage("BOOT: Configuring camera");
   // Zero-initialise: esp_camera_init() reads every field, including ones this
@@ -1012,6 +1230,9 @@ void setup() {
   } else {
     setDebugMessage("BOOT: Camera orientation normal");
   }
+
+  // After the Video_Flip default, so a saved orientation wins over it.
+  loadCameraSettings();
 
   setDebugMessage("BOOT: Connecting to configured Wi-Fi");
   WiFi.mode(WIFI_STA);
@@ -1120,6 +1341,8 @@ void loop() {
   // Outside the OTA guard on purpose: a firmware write is exactly when you
   // most want to see that the board is still alive.
   serviceHeartbeat();
+  serviceSettingsSave();
+  serviceWifiApply();
 
   delay(10);
 }
@@ -1219,6 +1442,366 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       letter-spacing: 0.03em;
     }
 
+    [hidden] {
+      display: none !important;
+    }
+
+    /* Two views of the same column. The video stays put above both, so a
+       program can be watched while it runs. */
+    .hero-tabs {
+      display: flex;
+      gap: 2px;
+      padding: 3px;
+      border: 1px solid rgba(255, 255, 255, 0.10);
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.04);
+    }
+
+    .hero-tab {
+      padding: 6px 15px;
+      border: 0;
+      border-radius: 999px;
+      background: transparent;
+      color: rgba(248, 250, 252, 0.65);
+      font-size: 13px;
+      font-weight: 700;
+      font-family: inherit;
+      cursor: pointer;
+    }
+
+    .hero-tab.is-active {
+      background: linear-gradient(135deg, #38bdf8, #0ea5e9);
+      color: #06243b;
+    }
+
+    .program-bar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      width: min(390px, 100%);
+      margin: 12px auto 0;
+      padding: 8px 10px;
+      border: 1px solid #d7dce5;
+      border-radius: 12px;
+      background: white;
+      text-align: left;
+    }
+
+    .program-action {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      min-height: 34px;
+      padding: 6px 13px;
+      border: 1px solid #cbd5e1;
+      border-radius: 999px;
+      background: #f1f5f9;
+      color: #172033;
+      font-size: 13px;
+      font-weight: 700;
+      font-family: inherit;
+      cursor: pointer;
+    }
+
+    .program-action:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+
+    .record-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #ef4444;
+    }
+
+    .program-record.is-recording {
+      border-color: #ef4444;
+      background: #fee2e2;
+    }
+
+    .program-record.is-recording .record-dot {
+      animation: linkPulse 1.1s ease-in-out infinite;
+    }
+
+    .program-play {
+      border-color: #0ea5e9;
+      background: #e0f2fe;
+    }
+
+    .program-stop {
+      border-color: #ef4444;
+      background: #fee2e2;
+    }
+
+    .program-status {
+      flex: 1 1 auto;
+      min-width: 0;
+      color: #667085;
+      font-size: 12px;
+      line-height: 1.3;
+    }
+
+    .program-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 10px;
+      text-align: left;
+    }
+
+    .program-count {
+      color: #667085;
+      font-size: 12px;
+    }
+
+    .program-steps {
+      max-height: 260px;
+      overflow-y: auto;
+      border: 1px solid #e2e8f0;
+      border-radius: 10px;
+      background: #f8fafc;
+    }
+
+    .program-steps:empty::after {
+      display: block;
+      padding: 18px 12px;
+      color: #94a3b8;
+      font-size: 13px;
+      content: "Press Record, drive the robot, then press Stop.";
+    }
+
+    .program-step {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 9px;
+      border-bottom: 1px solid #e8edf3;
+      font-size: 13px;
+      text-align: left;
+    }
+
+    .program-step:last-child {
+      border-bottom: 0;
+    }
+
+    .program-step.is-current {
+      background: #e0f2fe;
+    }
+
+    .step-index {
+      flex: 0 0 22px;
+      color: #94a3b8;
+      font-size: 11px;
+    }
+
+    .step-delay {
+      flex: 0 0 66px;
+      min-height: 30px;
+      padding: 3px 6px;
+      border: 1px solid #cbd5e1;
+      border-radius: 7px;
+      font-size: 13px;
+      font-family: inherit;
+    }
+
+    .step-desc {
+      flex: 1 1 auto;
+      min-width: 0;
+      font-weight: 700;
+      overflow-wrap: anywhere;
+    }
+
+    .step-remove {
+      flex: 0 0 auto;
+      min-width: 30px;
+      min-height: 30px;
+      border: 0;
+      border-radius: 8px;
+      background: #f1f5f9;
+      color: #64748b;
+      font-size: 14px;
+      cursor: pointer;
+    }
+
+    .program-buttons {
+      display: flex;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .program-slots {
+      margin-top: 12px;
+      border-top: 1px solid #e2e8f0;
+      padding-top: 10px;
+    }
+
+    .program-slot {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 6px;
+      font-size: 13px;
+      text-align: left;
+    }
+
+    .slot-name {
+      flex: 0 0 54px;
+      font-weight: 700;
+    }
+
+    .slot-info {
+      flex: 1 1 auto;
+      min-width: 0;
+      color: #667085;
+      font-size: 12px;
+    }
+
+    .slot-button {
+      min-height: 30px;
+      padding: 4px 11px;
+      border: 1px solid #cbd5e1;
+      border-radius: 999px;
+      background: #f1f5f9;
+      color: #172033;
+      font-size: 12px;
+      font-weight: 700;
+      font-family: inherit;
+      cursor: pointer;
+    }
+
+    .wifi-list {
+      margin-top: 8px;
+      max-height: 190px;
+      overflow-y: auto;
+    }
+
+    .wifi-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      width: 100%;
+      min-height: 36px;
+      margin-top: 4px;
+      padding: 6px 10px;
+      border: 1px solid #e2e8f0;
+      border-radius: 9px;
+      background: #f8fafc;
+      color: #172033;
+      font-family: inherit;
+      font-size: 13px;
+      text-align: left;
+      cursor: pointer;
+    }
+
+    .wifi-row:hover {
+      background: #eef2f7;
+    }
+
+    .wifi-name {
+      min-width: 0;
+      overflow-wrap: anywhere;
+      font-weight: 700;
+    }
+
+    .wifi-signal {
+      flex: 0 0 auto;
+      color: #667085;
+      font-size: 12px;
+    }
+
+    .robot-name-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .setting-note {
+      margin-top: 6px;
+      color: #667085;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+
+    .modal {
+      position: fixed;
+      inset: 0;
+      z-index: 1200;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+      background: rgba(9, 14, 26, 0.62);
+    }
+
+    .modal-card {
+      width: min(520px, 100%);
+      max-height: 86vh;
+      overflow-y: auto;
+      padding: 16px;
+      border-radius: 16px;
+      background: white;
+      color: #172033;
+      text-align: left;
+      box-shadow: 0 24px 60px rgba(0, 0, 0, 0.35);
+    }
+
+    .modal-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+      font-size: 17px;
+    }
+
+    .gallery-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+      gap: 10px;
+    }
+
+    .gallery-cell {
+      border: 1px solid #e2e8f0;
+      border-radius: 10px;
+      overflow: hidden;
+      background: #f8fafc;
+    }
+
+    .gallery-image {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+
+    .gallery-actions {
+      display: flex;
+      gap: 6px;
+      padding: 7px;
+    }
+
+    .activity-line {
+      margin: 0 0 12px;
+      font-size: 15px;
+      line-height: 1.5;
+    }
+
+    .activity-buttons {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .activity-result {
+      margin: 12px 0 0;
+      color: #0f766e;
+      font-size: 14px;
+      font-weight: 700;
+      line-height: 1.4;
+    }
+
     .hero-right {
       display: flex;
       align-items: center;
@@ -1308,7 +1891,16 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       }
 
       .hero-subtitle {
-        font-size: 10px;
+        display: none;
+      }
+
+      .hero-tab {
+        padding: 6px 11px;
+        font-size: 12px;
+      }
+
+      .hero-inner {
+        gap: 8px;
       }
     }
 
@@ -2159,12 +2751,19 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
         <svg class="hero-logo" aria-hidden="true" focusable="false"><use href="#wdiLogo"></use></svg>
 
         <div class="hero-titles">
-          <div class="hero-title">ESP32-CAM Robot</div>
+          <div id="heroTitle" class="hero-title">ESP32-CAM Robot</div>
           <div class="hero-subtitle">
             workshop-diy.org
             <span id="heroBuild" class="hero-badge">--</span>
           </div>
         </div>
+      </div>
+
+      <div class="hero-tabs" role="tablist" aria-label="View">
+        <button id="tabDrive" class="hero-tab is-active" type="button"
+                role="tab" aria-selected="true">Drive</button>
+        <button id="tabProgram" class="hero-tab" type="button"
+                role="tab" aria-selected="false">Program</button>
       </div>
 
       <div class="hero-right">
@@ -2186,7 +2785,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
   <aside id="settingsSidebar" class="settings-sidebar" aria-label="Settings sidebar">
     <h2>Settings</h2>
 
-    <details class="settings-section" open>
+    <details class="settings-section" data-pref="camera" open>
       <summary>Camera</summary>
 
       <div class="setting-row">
@@ -2289,7 +2888,91 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       </div>
     </details>
 
-    <details class="settings-section">
+    <details class="settings-section" data-pref="robot">
+      <summary>Robot</summary>
+
+      <div class="setting-row">
+        <div class="setting-head"><strong>Name</strong></div>
+        <div class="robot-name-row">
+          <input id="robotNameInput" class="ota-input" type="text"
+                 maxlength="32" autocomplete="off"
+                 placeholder="Name this robot">
+          <button id="robotNameSave" class="slot-button" type="button">Save</button>
+        </div>
+        <div class="setting-note">
+          Shown in the header and used for exported files. Eight identical
+          robots in a room are only told apart by this.
+        </div>
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-head">
+          <strong>Speed limit</strong>
+          <span id="speedCapValue" class="setting-value">255 / 255</span>
+        </div>
+        <input id="speedCapSlider" class="camera-range" type="range"
+               min="20" max="255" step="5" value="255">
+        <div class="setting-note">
+          The robot refuses anything above this, however the command arrives.
+        </div>
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-head"><strong>Wake-up numbers</strong></div>
+        <div class="setting-note">
+          Left wheel: <strong id="thresholdLeft">not measured</strong><br>
+          Right wheel: <strong id="thresholdRight">not measured</strong>
+        </div>
+        <button id="activityOpen" class="slot-button" type="button">Measure them</button>
+      </div>
+
+      <div id="robotSettingsStatus" class="setting-note"></div>
+    </details>
+
+    <details class="settings-section" data-pref="wifi">
+      <summary>Wi-Fi</summary>
+
+      <div class="setting-row">
+        <div class="setting-head">
+          <strong>Now</strong>
+          <span id="wifiNow" class="setting-value">--</span>
+        </div>
+      </div>
+
+      <div class="setting-row">
+        <button id="wifiScan" class="slot-button" type="button">Scan for networks</button>
+        <div class="setting-note">
+          A scan uses the same radio as the video, so expect a hiccup of a
+          second or two.
+        </div>
+        <div id="wifiList" class="wifi-list"></div>
+      </div>
+
+      <div class="setting-row">
+        <label class="ota-label" for="wifiSsidInput">Network name</label>
+        <input id="wifiSsidInput" class="ota-input" type="text" maxlength="32"
+               autocomplete="off" placeholder="Network name">
+
+        <label class="ota-label" for="wifiPassInput">Password</label>
+        <input id="wifiPassInput" class="ota-input" type="password" maxlength="64"
+               autocomplete="off" placeholder="Empty for an open network">
+
+        <button id="wifiConnect" class="program-action program-play" type="button">
+          Save and connect
+        </button>
+
+        <div class="setting-note">
+          The robot keeps its own access point running throughout, so a failed
+          attempt cannot lock you out -- but you may be disconnected for a few
+          seconds while it tries. The password is stored on the robot in plain
+          text; treat it as convenience, not security.
+        </div>
+
+        <div id="wifiStatus" class="setting-note"></div>
+      </div>
+    </details>
+
+    <details class="settings-section" data-pref="serial">
       <summary>USB Serial console</summary>
 
       <div id="webSerialSupport" class="serial-web-status">
@@ -2369,7 +3052,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       </div>
     </details>
 
-    <details class="settings-section">
+    <details class="settings-section" data-pref="ota">
       <summary>Firmware update (OTA)</summary>
 
     <div class="ota-panel">
@@ -2474,6 +3157,23 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       </div>
     </div>
 
+    <div id="programBar" class="program-bar">
+      <button id="recordButton" class="program-action program-record" type="button">
+        <span class="record-dot"></span><span id="recordLabel">Record</span>
+      </button>
+
+      <button id="photoButton" class="program-action" type="button">Photo</button>
+
+      <button id="galleryButton" class="program-action" type="button" hidden>
+        Photos <span id="galleryCount">0</span>
+      </button>
+
+      <span id="programStatus" class="program-status">Drive, and the robot writes down what you did.</span>
+
+      <button id="programStopButton" class="program-action program-stop" type="button" hidden>Stop</button>
+    </div>
+
+    <div id="driveView">
     <div class="panel">
       <div class="ui-version">UI: Sync + Serial + Camera Settings + Rotation</div>
 
@@ -2572,6 +3272,88 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
         At very low values a motor may buzz without rotating; that lets students
         discover the real starting threshold of each motor.
         Reverse still needs an H-bridge motor driver.
+      </div>
+    </div>
+    </div>
+
+    <div id="programView" class="panel" hidden>
+      <div class="program-head">
+        <strong>Your program</strong>
+        <span id="programCount" class="program-count">no steps yet</span>
+      </div>
+
+      <div id="programSteps" class="program-steps"></div>
+
+      <div class="program-buttons">
+        <button id="playButton" class="program-action program-play" type="button">Play</button>
+        <button id="clearProgramButton" class="program-action" type="button">Clear</button>
+      </div>
+
+      <div class="program-slots">
+        <div class="program-slot" data-slot="1">
+          <span class="slot-name">Slot 1</span>
+          <span class="slot-info" data-slot-info="1">empty</span>
+          <button class="slot-button" data-slot-save="1" type="button">Save</button>
+          <button class="slot-button" data-slot-load="1" type="button">Load</button>
+        </div>
+        <div class="program-slot" data-slot="2">
+          <span class="slot-name">Slot 2</span>
+          <span class="slot-info" data-slot-info="2">empty</span>
+          <button class="slot-button" data-slot-save="2" type="button">Save</button>
+          <button class="slot-button" data-slot-load="2" type="button">Load</button>
+        </div>
+        <div class="program-slot" data-slot="3">
+          <span class="slot-name">Slot 3</span>
+          <span class="slot-info" data-slot-info="3">empty</span>
+          <button class="slot-button" data-slot-save="3" type="button">Save</button>
+          <button class="slot-button" data-slot-load="3" type="button">Load</button>
+        </div>
+      </div>
+
+      <div class="note">
+        Each line is one instruction and the pause before it. Change a pause,
+        delete a line, then press Play and watch what changes. The robot stops
+        the moment you press Stop, leave this page, or switch away from it.
+      </div>
+    </div>
+  </div>
+
+  <div id="galleryModal" class="modal" hidden>
+    <div class="modal-card">
+      <div class="modal-head">
+        <strong>Photos</strong>
+        <button id="galleryClose" class="slot-button" type="button">Close</button>
+      </div>
+      <div id="galleryGrid" class="gallery-grid"></div>
+      <div class="note">
+        Photos live in this browser until you close the page. Save the ones
+        you want to keep.
+      </div>
+    </div>
+  </div>
+
+  <div id="activityModal" class="modal" hidden>
+    <div class="modal-card">
+      <div class="modal-head">
+        <strong>Find the wake-up number</strong>
+        <button id="activityClose" class="slot-button" type="button">Close</button>
+      </div>
+
+      <p class="activity-line">
+        Watch the <strong id="activityWheel">left</strong> wheel. Power is at
+        <strong id="activityValue">20</strong> out of 255.
+      </p>
+
+      <div class="activity-buttons">
+        <button id="activityHigher" class="program-action" type="button">Not moving - go higher</button>
+        <button id="activityMoving" class="program-action program-play" type="button">It is moving!</button>
+      </div>
+
+      <p id="activityResult" class="activity-result"></p>
+
+      <div class="note">
+        A motor needs a push before it turns at all, and no two motors need
+        the same one. Below that number it only buzzes - do not leave it there.
       </div>
     </div>
   </div>
@@ -2703,6 +3485,27 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       return CAMERA_DIMENSIONS[selected] || [640, 480];
     }
 
+    // Per-viewer preferences. Anything the robot owns -- camera tuning, motor
+    // speeds, LED -- is saved on the robot instead, so a second browser does
+    // not restore a different set of values over it.
+    const PREF_PREFIX = "esp32Robot";
+
+    function prefGet(key, fallback) {
+      try {
+        const value = localStorage.getItem(PREF_PREFIX + key);
+        return value === null ? fallback : value;
+      } catch (error) {
+        return fallback;
+      }
+    }
+
+    function prefSet(key, value) {
+      try {
+        localStorage.setItem(PREF_PREFIX + key, String(value));
+      } catch (error) {
+      }
+    }
+
     function applyImageRotation(degrees) {
       const normalized =
         ((Number(degrees) || 0) % 360 + 360) % 360;
@@ -2713,13 +3516,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
 
       cameraRotation.value = String(cameraRotationDegrees);
 
-      try {
-        localStorage.setItem(
-          "esp32RobotCameraRotation",
-          String(cameraRotationDegrees)
-        );
-      } catch (error) {
-      }
+      prefSet("CameraRotation", cameraRotationDegrees);
 
       const [sourceWidth, sourceHeight] = cameraDimensions();
       const quarterTurn =
@@ -2756,15 +3553,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     }
 
     function restoreImageRotation() {
-      let saved = "0";
-
-      try {
-        saved =
-          localStorage.getItem("esp32RobotCameraRotation") || "0";
-      } catch (error) {
-      }
-
-      applyImageRotation(saved);
+      applyImageRotation(prefGet("CameraRotation", "0"));
     }
 
     window.addEventListener("resize", () => {
@@ -3036,23 +3825,65 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       }
     });
 
+    function restoreViewerPreferences() {
+      const savedBaud = prefGet("SerialBaud", null);
+
+      if (savedBaud &&
+          [...serialBaud.options].some((o) => o.value === savedBaud)) {
+        serialBaud.value = savedBaud;
+      }
+
+      serialAutoScroll.checked = prefGet("SerialAutoScroll", "1") === "1";
+
+      showView(prefGet("View", "drive"));
+      renderSlots();
+      renderProgram();
+
+      document.querySelectorAll(".settings-section[data-pref]")
+        .forEach((section) => {
+          const saved = prefGet("Section:" + section.dataset.pref, null);
+          if (saved !== null) section.open = saved === "1";
+        });
+    }
+
+    serialBaud.addEventListener("change", () => {
+      prefSet("SerialBaud", serialBaud.value);
+    });
+
+    serialAutoScroll.addEventListener("change", () => {
+      prefSet("SerialAutoScroll", serialAutoScroll.checked ? "1" : "0");
+    });
+
+    document.querySelectorAll(".settings-section[data-pref]")
+      .forEach((section) => {
+        const summary = section.querySelector("summary");
+        if (!summary) return;
+
+        // Saving on the "toggle" event would also record the browser's own
+        // session-history restoration of <details>, which fires after load
+        // and would overwrite the stored choice with the previous one. A
+        // click is the only signal that means the person wanted this.
+        summary.addEventListener("click", () => {
+          // The click runs before the element flips, so the value being
+          // chosen is the opposite of what it reads right now.
+          prefSet("Section:" + section.dataset.pref, section.open ? "0" : "1");
+        });
+      });
+
     window.addEventListener("load", () => {
       restoreImageRotation();
       startStream();
 
-      // One small request for the build stamp in the header badge, once, and
-      // late enough not to compete with the stream opening.
-      setTimeout(ensureBuildInfo, 2000);
+      restoreViewerPreferences();
 
-      sendMotorSpeed("left", leftSpeedSlider.value);
-      sendMotorSpeed("right", rightSpeedSlider.value);
+      // Again on the next task: Chromium reinstates <details> open state from
+      // session history after load, and would otherwise reopen a section the
+      // viewer had closed.
+      setTimeout(restoreViewerPreferences, 60);
 
-      ledBrightnessValue.textContent =
-        ledBrightnessLabel(ledBrightnessSlider.value);
-      request(
-        "/action?ledBrightness=" +
-        encodeURIComponent(ledBrightnessSlider.value)
-      );
+      // Reads the robot's build stamp, motor speeds and LED state. It sends
+      // nothing: the robot is the source of truth for all three.
+      adoptRobotState(false);
     });
 
     function request(path) {
@@ -3085,6 +3916,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
 
     function sendMotorSpeed(motor, value) {
       const v = clamp255(value);
+      recordStep({ kind: "speed", motor: motor, value: v });
       request("/action?" + motor + "Speed=" + v);
     }
 
@@ -3150,6 +3982,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     }
 
     leftSpeedSlider.addEventListener("input", () => {
+      userAdjustedControls = true;
       scheduleMotorSpeed("left", leftSpeedSlider.value);
     });
 
@@ -3158,6 +3991,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     });
 
     rightSpeedSlider.addEventListener("input", () => {
+      userAdjustedControls = true;
       scheduleMotorSpeed("right", rightSpeedSlider.value);
     });
 
@@ -3747,6 +4581,18 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     // worse than an extra request.
     async function ensureBuildInfo() {
       if (buildFetched) return;
+      await adoptRobotState(true);
+    }
+
+    // The page used to push its own slider defaults into the robot on every
+    // load, so opening a second tab reset the motor speeds and the LED under
+    // whoever was driving. The robot owns those values -- and now remembers
+    // them across a reboot -- so the page reads them instead.
+    let robotStateAdopted = false;
+    let userAdjustedControls = false;
+
+    async function adoptRobotState(buildOnly) {
+      let data = null;
 
       try {
         const response = await fetch(
@@ -3756,14 +4602,41 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
 
         if (!response.ok) return;
 
-        const data = await response.json();
-        if (!data.build) return;
+        data = await response.json();
+      } catch (error) {
+        return;
+      }
 
+      if (data.build) {
         dbgBuild.textContent = data.build;
         heroBuild.textContent = data.build;
         buildFetched = true;
-      } catch (error) {
       }
+
+      showCurrentNetwork(data);
+
+      if (data.robotName) applyRobotName(data.robotName);
+      if (data.maxPwm) applySpeedCap(data.maxPwm);
+      applyThresholds(data.leftThreshold, data.rightThreshold);
+
+      // Once only, and never over a control the driver has already touched.
+      if (buildOnly || robotStateAdopted || userAdjustedControls) return;
+      robotStateAdopted = true;
+
+      applyRobotName(data.robotName);
+      applySpeedCap(data.maxPwm);
+      applyThresholds(data.leftThreshold, data.rightThreshold);
+
+      setMotorUi("left", data.leftTarget);
+      setMotorUi("right", data.rightTarget);
+
+      ledState = Boolean(data.ledEnabled);
+      ledButton.classList.toggle("led-on", ledState);
+      ledButton.textContent = ledState ? "ON" : "OFF";
+
+      ledBrightnessSlider.value = String(clamp255(data.ledBrightness));
+      ledBrightnessValue.textContent =
+        ledBrightnessLabel(ledBrightnessSlider.value);
     }
 
     settingsToggle.addEventListener("click", () => {
@@ -3869,6 +4742,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
         dbgLed.textContent =
           (data.ledEnabled ? "ON " : "OFF ") +
           data.ledBrightness + " / 255";
+        showCurrentNetwork(data);
         dbgNetworkMode.textContent = data.networkMode || "--";
         dbgStaStatus.textContent = data.staStatus || "--";
         dbgNetworkSsid.textContent = data.networkSsid || "--";
@@ -4044,6 +4918,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
 
     function sendStopTwice() {
       showLocalMotion(null);
+      recordStep({ kind: "go", action: "stop" });
       sendAction("stop");
 
       clearTimeout(driveStopRepeatTimer);
@@ -4058,6 +4933,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
 
       activeDriveAction = action;
       showLocalMotion(action);
+      recordStep({ kind: "go", action: action });
       sendAction(action);
 
       driveKeepaliveTimer = setInterval(() => {
@@ -4112,11 +4988,16 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
 
     // Releases the browser may never report on the button itself: the window
     // losing focus mid-press, the tab being hidden, the page going away.
-    window.addEventListener("blur", () => endDrive());
-    window.addEventListener("pagehide", () => endDrive());
+    // A running program drives the robot exactly as a held button does, so
+    // everything that ends a drive ends a replay too.
+    window.addEventListener("blur", () => { stopPlayback(); endDrive(); });
+    window.addEventListener("pagehide", () => { stopPlayback(); endDrive(); });
 
     document.addEventListener("visibilitychange", () => {
-      if (document.hidden) endDrive();
+      if (document.hidden) {
+        stopPlayback();
+        endDrive();
+      }
     });
 
     stopButton.addEventListener("pointerdown", (event) => {
@@ -4125,9 +5006,839 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       sendStopTwice();
     });
 
+
+    // ---- Record and replay -----------------------------------------------
+    // Every command the page sends already passes through beginDrive(),
+    // sendStopTwice() and sendMotorSpeed(), so a recording is just those
+    // calls with the pause before each one written down. Playing it back
+    // calls the same functions, which means a replay gets the keepalives and
+    // the dead man's switch for free, exactly like a person driving.
+
+    const tabDrive = document.getElementById("tabDrive");
+    const tabProgram = document.getElementById("tabProgram");
+    const driveView = document.getElementById("driveView");
+    const programView = document.getElementById("programView");
+    const recordButton = document.getElementById("recordButton");
+    const recordLabel = document.getElementById("recordLabel");
+    const programStatus = document.getElementById("programStatus");
+    const programStopButton = document.getElementById("programStopButton");
+    const programSteps = document.getElementById("programSteps");
+    const programCount = document.getElementById("programCount");
+    const playButton = document.getElementById("playButton");
+    const clearProgramButton = document.getElementById("clearProgramButton");
+
+    // Long enough for anything a child records by hand, short enough that a
+    // stuck finger cannot fill the browser's storage.
+    const PROGRAM_MAX_STEPS = 200;
+
+    // Two slider moves inside this window are one adjustment, not two steps.
+    const SPEED_COALESCE_MS = 500;
+
+    let program = [];
+    let recording = false;
+    let replaying = false;
+    let lastStepMs = 0;
+    let playTimer = null;
+    let playIndex = 0;
+
+    function stepDescription(step) {
+      if (step.kind === "speed") {
+        return (step.motor === "left" ? "Left motor " : "Right motor ") +
+          step.value;
+      }
+
+      if (step.action === "forward") return "Forward";
+      if (step.action === "left") return "Left";
+      if (step.action === "right") return "Right";
+      return "Stop";
+    }
+
+    function recordStep(step) {
+      // A replay drives through these same functions; recording that would
+      // append the program to itself.
+      if (!recording || replaying) return;
+      if (program.length >= PROGRAM_MAX_STEPS) return;
+
+      const now = Date.now();
+      const previous = program[program.length - 1];
+
+      if (previous) {
+        // A held button repeats itself every 250 ms and a dragged slider
+        // fires continuously. Neither is a new instruction.
+        if (step.kind === "go" && previous.kind === "go" &&
+            previous.action === step.action) {
+          return;
+        }
+
+        if (step.kind === "speed" && previous.kind === "speed" &&
+            previous.motor === step.motor &&
+            now - lastStepMs < SPEED_COALESCE_MS) {
+          previous.value = step.value;
+          renderProgram();
+          return;
+        }
+      }
+
+      step.delay = program.length === 0
+        ? 0
+        : Math.min(60, Math.round((now - lastStepMs) / 100) / 10);
+
+      lastStepMs = now;
+      program.push(step);
+      renderProgram();
+    }
+
+    function renderProgram() {
+      programSteps.textContent = "";
+
+      program.forEach((step, index) => {
+        const row = document.createElement("div");
+        row.className = "program-step";
+        if (replaying && index === playIndex) row.classList.add("is-current");
+
+        const number = document.createElement("span");
+        number.className = "step-index";
+        number.textContent = String(index + 1);
+
+        const delay = document.createElement("input");
+        delay.className = "step-delay";
+        delay.type = "number";
+        delay.min = "0";
+        delay.max = "60";
+        delay.step = "0.1";
+        delay.value = String(step.delay);
+        delay.setAttribute("aria-label", "Pause before step " + (index + 1));
+
+        delay.addEventListener("change", () => {
+          const seconds = Number(delay.value);
+          step.delay = Number.isFinite(seconds)
+            ? Math.max(0, Math.min(60, seconds))
+            : 0;
+          delay.value = String(step.delay);
+          updateProgramCount();
+        });
+
+        const description = document.createElement("span");
+        description.className = "step-desc";
+        description.textContent = stepDescription(step);
+
+        const remove = document.createElement("button");
+        remove.className = "step-remove";
+        remove.type = "button";
+        remove.textContent = "×";
+        remove.setAttribute("aria-label", "Delete step " + (index + 1));
+
+        remove.addEventListener("click", () => {
+          program.splice(index, 1);
+          renderProgram();
+        });
+
+        row.append(number, delay, description, remove);
+        programSteps.append(row);
+      });
+
+      updateProgramCount();
+    }
+
+    function programSeconds() {
+      return program.reduce((total, step) => total + (step.delay || 0), 0);
+    }
+
+    function updateProgramCount() {
+      if (program.length === 0) {
+        programCount.textContent = "no steps yet";
+      } else {
+        programCount.textContent =
+          program.length + " step" + (program.length === 1 ? "" : "s") +
+          " - " + programSeconds().toFixed(1) + "s";
+      }
+
+      playButton.disabled = program.length === 0 || recording;
+      clearProgramButton.disabled = program.length === 0 || recording;
+    }
+
+    function setProgramStatus(text) {
+      programStatus.textContent = text;
+    }
+
+    function startRecording() {
+      stopPlayback();
+
+      program = [];
+      recording = true;
+      lastStepMs = Date.now();
+
+      recordButton.classList.add("is-recording");
+      recordLabel.textContent = "Recording";
+      programStopButton.hidden = false;
+
+      setProgramStatus("Drive the robot. Every command is written down.");
+      renderProgram();
+    }
+
+    function stopRecording() {
+      if (!recording) return;
+
+      recording = false;
+      recordButton.classList.remove("is-recording");
+      recordLabel.textContent = "Record";
+      programStopButton.hidden = replaying;
+
+      setProgramStatus(
+        program.length
+          ? ("Recorded " + program.length + " steps. Open Program to play it.")
+          : "Nothing recorded."
+      );
+
+      updateProgramCount();
+    }
+
+    function stopPlayback() {
+      if (!replaying) return;
+
+      clearTimeout(playTimer);
+      playTimer = null;
+      replaying = false;
+      playIndex = 0;
+
+      // Whatever the program was in the middle of, the robot stops.
+      clearDriveKeepalive();
+      sendStopTwice();
+
+      programStopButton.hidden = recording;
+      playButton.disabled = program.length === 0;
+      setProgramStatus("Stopped.");
+      renderProgram();
+    }
+
+    function runStep() {
+      if (!replaying) return;
+
+      if (playIndex >= program.length) {
+        const finished = program.length;
+        stopPlayback();
+        setProgramStatus("Finished " + finished + " steps.");
+        return;
+      }
+
+      const step = program[playIndex];
+
+      playTimer = setTimeout(() => {
+        if (!replaying) return;
+
+        if (step.kind === "speed") {
+          setMotorUi(step.motor, step.value);
+          sendMotorSpeed(step.motor, step.value);
+        } else if (step.action === "stop") {
+          clearDriveKeepalive();
+          sendStopTwice();
+        } else {
+          // beginDrive() starts the keepalive, so a replayed drive survives
+          // the robot's 600 ms motion timeout just as a held button does.
+          beginDrive(step.action);
+        }
+
+        setProgramStatus(
+          "Playing step " + (playIndex + 1) + " of " + program.length + "."
+        );
+
+        playIndex++;
+        renderProgram();
+        runStep();
+      }, Math.max(0, (step.delay || 0) * 1000));
+    }
+
+    function startPlayback() {
+      if (recording || replaying || program.length === 0) return;
+
+      replaying = true;
+      playIndex = 0;
+      playButton.disabled = true;
+      programStopButton.hidden = false;
+
+      setProgramStatus("Playing...");
+      runStep();
+    }
+
+    recordButton.addEventListener("click", () => {
+      if (recording) {
+        stopRecording();
+      } else {
+        startRecording();
+      }
+    });
+
+    programStopButton.addEventListener("click", () => {
+      stopRecording();
+      stopPlayback();
+    });
+
+    playButton.addEventListener("click", startPlayback);
+
+    clearProgramButton.addEventListener("click", () => {
+      if (recording || replaying) return;
+
+      program = [];
+      renderProgram();
+      setProgramStatus("Cleared.");
+    });
+
+    // ---- Slots ------------------------------------------------------------
+    // A recording is something the child made, so it lives in their browser.
+    // The robot's own settings stay on the robot.
+
+    // Slots live on the robot, not in this browser: a program should follow
+    // the robot round the classroom, not the tablet that recorded it.
+    async function readSlot(slot) {
+      try {
+        const response = await fetch("/program?slot=" + slot, {
+          cache: "no-store"
+        });
+
+        if (!response.ok) return null;
+
+        const loaded = await response.json();
+        return Array.isArray(loaded) ? loaded : null;
+      } catch (error) {
+        return null;
+      }
+    }
+
+    async function renderSlots() {
+      const infos = [...document.querySelectorAll("[data-slot-info]")];
+
+      for (const info of infos) {
+        const loaded = await readSlot(info.dataset.slotInfo);
+        const steps = loaded ? loaded.length : 0;
+
+        info.textContent = steps
+          ? (steps + " step" + (steps === 1 ? "" : "s"))
+          : "empty";
+      }
+    }
+
+    document.querySelectorAll("[data-slot-save]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        if (!program.length) {
+          setProgramStatus("Nothing to save yet.");
+          return;
+        }
+
+        const slot = button.dataset.slotSave;
+        setProgramStatus("Saving to slot " + slot + "...");
+
+        try {
+          const response = await fetch("/program?slot=" + slot, {
+            method: "POST",
+            body: JSON.stringify(program)
+          });
+
+          if (!response.ok) throw new Error("HTTP " + response.status);
+
+          await renderSlots();
+          setProgramStatus("Saved to slot " + slot + " on the robot.");
+        } catch (error) {
+          setProgramStatus("Could not save: " + error.message);
+        }
+      });
+    });
+
+    document.querySelectorAll("[data-slot-load]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        if (recording || replaying) return;
+
+        const slot = button.dataset.slotLoad;
+        const loaded = await readSlot(slot);
+
+        if (!loaded || !loaded.length) {
+          setProgramStatus("Slot " + slot + " is empty.");
+          return;
+        }
+
+        program = loaded.slice(0, PROGRAM_MAX_STEPS);
+        renderProgram();
+        setProgramStatus("Loaded slot " + slot + ".");
+      });
+    });
+
+    // ---- Views ------------------------------------------------------------
+    // The video stays above both views, so a program can be watched running.
+
+    function showView(view) {
+      const wantsProgram = view === "program";
+
+      driveView.hidden = wantsProgram;
+      programView.hidden = !wantsProgram;
+
+      tabDrive.classList.toggle("is-active", !wantsProgram);
+      tabProgram.classList.toggle("is-active", wantsProgram);
+      tabDrive.setAttribute("aria-selected", String(!wantsProgram));
+      tabProgram.setAttribute("aria-selected", String(wantsProgram));
+
+      prefSet("View", view);
+    }
+
+    tabDrive.addEventListener("click", () => showView("drive"));
+    tabProgram.addEventListener("click", () => showView("program"));
+
+
+    // ---- Robot identity and limits ---------------------------------------
+
+    const robotNameInput = document.getElementById("robotNameInput");
+    const robotNameSave = document.getElementById("robotNameSave");
+    const speedCapSlider = document.getElementById("speedCapSlider");
+    const speedCapValue = document.getElementById("speedCapValue");
+    const thresholdLeft = document.getElementById("thresholdLeft");
+    const thresholdRight = document.getElementById("thresholdRight");
+    const robotSettingsStatus = document.getElementById("robotSettingsStatus");
+
+    function applyRobotName(name) {
+      const trimmed = String(name || "").trim() || "ESP32-CAM Robot";
+
+      heroTitle.textContent = trimmed;
+      document.title = trimmed;
+
+      if (document.activeElement !== robotNameInput) {
+        robotNameInput.value = trimmed;
+      }
+    }
+
+    function applySpeedCap(limit) {
+      const capped = Math.max(20, Math.min(255, Number(limit) || 255));
+
+      speedCapSlider.value = String(capped);
+      speedCapValue.textContent = capped + " / 255";
+
+      // The firmware is the authority; this just stops the sliders offering
+      // numbers the robot will refuse.
+      leftSpeedSlider.max = String(capped);
+      rightSpeedSlider.max = String(capped);
+
+      if (Number(leftSpeedSlider.value) > capped) setMotorUi("left", capped);
+      if (Number(rightSpeedSlider.value) > capped) setMotorUi("right", capped);
+    }
+
+    function applyThresholds(left, right) {
+      thresholdLeft.textContent = left ? String(left) : "not measured";
+      thresholdRight.textContent = right ? String(right) : "not measured";
+    }
+
+    robotNameSave.addEventListener("click", () => {
+      const name = robotNameInput.value.trim().slice(0, 32);
+      if (!name) return;
+
+      request("/action?robotName=" + encodeURIComponent(name));
+      applyRobotName(name);
+      robotSettingsStatus.textContent = "Name saved.";
+    });
+
+    speedCapSlider.addEventListener("input", () => {
+      speedCapValue.textContent = speedCapSlider.value + " / 255";
+    });
+
+    speedCapSlider.addEventListener("change", () => {
+      applySpeedCap(speedCapSlider.value);
+      request("/action?maxPwm=" + encodeURIComponent(speedCapSlider.value));
+      robotSettingsStatus.textContent =
+        "Speed limit " + speedCapSlider.value + " / 255.";
+    });
+
+    // ---- Photos -----------------------------------------------------------
+
+    const photoButton = document.getElementById("photoButton");
+    const galleryButton = document.getElementById("galleryButton");
+    const galleryCount = document.getElementById("galleryCount");
+    const galleryModal = document.getElementById("galleryModal");
+    const galleryGrid = document.getElementById("galleryGrid");
+    const galleryClose = document.getElementById("galleryClose");
+
+    // Object URLs, held for the session. Downloading is how a photo is kept:
+    // a few VGA frames would be most of the browser's storage quota.
+    let photos = [];
+
+    function photoStamp(date) {
+      const pad = (n) => String(n).padStart(2, "0");
+      return date.getFullYear() + pad(date.getMonth() + 1) + pad(date.getDate()) +
+        "_" + pad(date.getHours()) + pad(date.getMinutes()) + pad(date.getSeconds());
+    }
+
+    function renderGallery() {
+      galleryCount.textContent = String(photos.length);
+      galleryButton.hidden = photos.length === 0;
+
+      galleryGrid.textContent = "";
+
+      photos.forEach((photo, index) => {
+        const cell = document.createElement("div");
+        cell.className = "gallery-cell";
+
+        const image = document.createElement("img");
+        image.className = "gallery-image";
+        image.src = photo.url;
+        image.alt = "Photo " + (index + 1);
+
+        const row = document.createElement("div");
+        row.className = "gallery-actions";
+
+        const save = document.createElement("a");
+        save.className = "slot-button";
+        save.textContent = "Save";
+        save.href = photo.url;
+        save.download = photo.name;
+
+        const drop = document.createElement("button");
+        drop.className = "slot-button";
+        drop.type = "button";
+        drop.textContent = "Delete";
+        drop.addEventListener("click", () => {
+          URL.revokeObjectURL(photo.url);
+          photos.splice(index, 1);
+          renderGallery();
+        });
+
+        row.append(save, drop);
+        cell.append(image, row);
+        galleryGrid.append(cell);
+      });
+    }
+
+    photoButton.addEventListener("click", async () => {
+      photoButton.disabled = true;
+      setProgramStatus("Taking a photo...");
+
+      try {
+        const response = await fetch("/capture?t=" + Date.now(), {
+          cache: "no-store"
+        });
+
+        if (!response.ok) throw new Error("HTTP " + response.status);
+
+        const blob = await response.blob();
+        const name = (robotNameInput.value.trim() || "robot")
+          .replace(/[^a-zA-Z0-9._-]+/g, "_") + "_" +
+          photoStamp(new Date()) + ".jpg";
+
+        photos.push({ url: URL.createObjectURL(blob), name: name });
+        renderGallery();
+
+        setProgramStatus(
+          "Photo " + photos.length + " taken. Open Photos to keep it."
+        );
+      } catch (error) {
+        setProgramStatus("Photo failed: " + error.message);
+      } finally {
+        photoButton.disabled = false;
+      }
+    });
+
+    galleryButton.addEventListener("click", () => {
+      renderGallery();
+      galleryModal.hidden = false;
+    });
+
+    galleryClose.addEventListener("click", () => {
+      galleryModal.hidden = true;
+    });
+
+    // ---- Wake-up number activity -----------------------------------------
+    // Walks the PWM up one step at a time and asks whether the wheel turned.
+    // The two motors will disagree, often by a lot, and that difference is
+    // the whole lesson: identical parts are not identical.
+
+    const activityModal = document.getElementById("activityModal");
+    const activityOpen = document.getElementById("activityOpen");
+    const activityClose = document.getElementById("activityClose");
+    const activityWheel = document.getElementById("activityWheel");
+    const activityValue = document.getElementById("activityValue");
+    const activityHigher = document.getElementById("activityHigher");
+    const activityMoving = document.getElementById("activityMoving");
+    const activityResult = document.getElementById("activityResult");
+
+    const ACTIVITY_START_PWM = 20;
+    const ACTIVITY_STEP = 5;
+
+    let activityWheelName = "left";
+    let activityPwm = ACTIVITY_START_PWM;
+
+    // The activity drives the motors at test values; whatever the robot was
+    // set to before goes back when it ends.
+    let activitySpeedsBefore = null;
+
+    // One motor at a time. Turning right runs the left wheel only, and
+    // turning left runs the right wheel only -- there is one MOSFET per
+    // motor, so steering is done by stopping a wheel.
+    function activityAction() {
+      return activityWheelName === "left" ? "right" : "left";
+    }
+
+    function activityStop() {
+      clearDriveKeepalive();
+      sendStopTwice();
+    }
+
+    function activityDrive() {
+      const capped = Math.min(activityPwm, Number(speedCapSlider.value) || 255);
+
+      activityValue.textContent = String(capped);
+      setMotorUi(activityWheelName, capped);
+      sendMotorSpeed(activityWheelName, capped);
+
+      // beginDrive keeps the keepalive running, so the wheel stays powered
+      // while the child watches it.
+      beginDrive(activityAction());
+    }
+
+    function activityStart(wheel, keepResult) {
+      activityWheelName = wheel;
+      activityPwm = ACTIVITY_START_PWM;
+
+      // Chaining to the second wheel keeps the first wheel's answer on
+      // screen; only a fresh run clears it.
+      if (!keepResult) activityResult.textContent = "";
+
+      activityWheel.textContent = wheel === "left" ? "left" : "right";
+      activityDrive();
+    }
+
+    activityOpen.addEventListener("click", () => {
+      stopPlayback();
+      closeSettingsSidebar();
+
+      activitySpeedsBefore = {
+        left: Number(leftSpeedSlider.value),
+        right: Number(rightSpeedSlider.value)
+      };
+
+      activityModal.hidden = false;
+      activityStart("left", false);
+    });
+
+    activityHigher.addEventListener("click", () => {
+      if (activityPwm >= 255) {
+        activityStop();
+        activityResult.textContent =
+          "Full power and still nothing. Check the wiring or the battery.";
+        return;
+      }
+
+      activityPwm = Math.min(255, activityPwm + ACTIVITY_STEP);
+      activityDrive();
+    });
+
+    activityMoving.addEventListener("click", () => {
+      const found = Number(activityValue.textContent) || 0;
+      activityStop();
+
+      request(
+        "/action?" + activityWheelName + "Threshold=" +
+        encodeURIComponent(found)
+      );
+
+      if (activityWheelName === "left") {
+        thresholdLeft.textContent = String(found);
+      } else {
+        thresholdRight.textContent = String(found);
+      }
+
+      if (activityWheelName === "left") {
+        activityResult.textContent =
+          "Left wheel wakes up at " + found + ". Now the right one.";
+        setTimeout(() => activityStart("right", true), 1600);
+      } else {
+        const left = Number(thresholdLeft.textContent) || 0;
+        const gap = Math.abs(left - found);
+
+        activityResult.textContent =
+          "Right wheel wakes up at " + found + ". " +
+          (left
+            ? ("The two differ by " + gap +
+               (gap > 10
+                 ? " -- that is why the robot pulls to one side."
+                 : " -- close enough to drive straight."))
+            : "");
+      }
+    });
+
+    function closeActivity() {
+      activityStop();
+      activityModal.hidden = true;
+
+      // Put the driving speeds back where the activity found them.
+      if (activitySpeedsBefore) {
+        setMotorUi("left", activitySpeedsBefore.left);
+        sendMotorSpeed("left", activitySpeedsBefore.left);
+        setMotorUi("right", activitySpeedsBefore.right);
+        sendMotorSpeed("right", activitySpeedsBefore.right);
+        activitySpeedsBefore = null;
+      }
+    }
+
+    activityClose.addEventListener("click", closeActivity);
+
+
+    // ---- Choosing a network ----------------------------------------------
+    // The credentials used to be compiled in, so moving the robot to another
+    // room meant reflashing it. They now live in NVS and can be set from here.
+
+    const wifiNow = document.getElementById("wifiNow");
+    const wifiScan = document.getElementById("wifiScan");
+    const wifiList = document.getElementById("wifiList");
+    const wifiSsidInput = document.getElementById("wifiSsidInput");
+    const wifiPassInput = document.getElementById("wifiPassInput");
+    const wifiConnect = document.getElementById("wifiConnect");
+    const wifiStatus = document.getElementById("wifiStatus");
+
+    const WIFI_WATCH_MS = 30000;
+    const WIFI_POLL_MS = 2000;
+
+    function describeNetwork(data) {
+      if (!data) return "--";
+
+      const mode = data.networkMode || "--";
+      const ssid = data.networkSsid || "--";
+
+      return data.staStatus === "WL_CONNECTED"
+        ? (ssid + " - " + (data.robotIp || "") + " (" + mode + ")")
+        : (mode + " - " + ssid);
+    }
+
+    function showCurrentNetwork(data) {
+      wifiNow.textContent = describeNetwork(data);
+    }
+
+    wifiScan.addEventListener("click", async () => {
+      wifiScan.disabled = true;
+      wifiList.textContent = "";
+      wifiStatus.textContent = "Scanning. The video will stutter for a moment.";
+
+      try {
+        const response = await fetch("/wifi?scan=1", { cache: "no-store" });
+        const data = await response.json();
+
+        // The robot explains itself -- "Stop the robot before scanning" is
+        // more use to a child than a status code.
+        if (!response.ok) {
+          throw new Error(data.error || ("HTTP " + response.status));
+        }
+        const networks = Array.isArray(data.networks) ? data.networks : [];
+
+        networks.sort((a, b) => Number(b.rssi) - Number(a.rssi));
+
+        if (!networks.length) {
+          wifiStatus.textContent = "No networks found.";
+          return;
+        }
+
+        networks.forEach((network) => {
+          const row = document.createElement("button");
+          row.className = "wifi-row";
+          row.type = "button";
+
+          const name = document.createElement("span");
+          name.className = "wifi-name";
+          name.textContent = network.ssid + (network.secure ? "" : " (open)");
+
+          const signal = document.createElement("span");
+          signal.className = "wifi-signal";
+          signal.textContent = network.rssi + " dBm";
+
+          row.append(name, signal);
+
+          row.addEventListener("click", () => {
+            wifiSsidInput.value = network.ssid;
+            wifiPassInput.value = "";
+            wifiPassInput.focus();
+            wifiStatus.textContent = "Selected " + network.ssid + ".";
+          });
+
+          wifiList.append(row);
+        });
+
+        wifiStatus.textContent =
+          "Found " + networks.length + ". Pick one, then type its password.";
+      } catch (error) {
+        wifiStatus.textContent = "Scan failed: " + error.message;
+      } finally {
+        wifiScan.disabled = false;
+      }
+    });
+
+    async function watchWifiOutcome(wanted) {
+      const until = Date.now() + WIFI_WATCH_MS;
+
+      while (Date.now() < until) {
+        await new Promise((resolve) => setTimeout(resolve, WIFI_POLL_MS));
+
+        let data = null;
+
+        try {
+          const response = await fetch(
+            "/status?after=" + STATUS_WITHOUT_EVENTS,
+            { cache: "no-store" }
+          );
+
+          if (response.ok) data = await response.json();
+        } catch (error) {
+          // The robot is off changing channel; that is expected here.
+          wifiStatus.textContent = "Waiting for the robot to come back...";
+          continue;
+        }
+
+        if (!data) continue;
+
+        showCurrentNetwork(data);
+
+        if (data.staStatus === "WL_CONNECTED" && data.networkSsid === wanted) {
+          wifiStatus.textContent =
+            "Connected to " + wanted + " at " + data.robotIp +
+            ". You can switch your device back to that network and open " +
+            "http://" + data.robotIp + " - the robot's own access point " +
+            "stays up either way.";
+          return;
+        }
+      }
+
+      wifiStatus.textContent =
+        "Not connected yet. The robot keeps retrying on its own, and its " +
+        "access point is still here. Check the password, or the event log.";
+    }
+
+    wifiConnect.addEventListener("click", async () => {
+      const wanted = wifiSsidInput.value.trim();
+
+      if (!wanted) {
+        wifiStatus.textContent = "Pick a network first.";
+        return;
+      }
+
+      wifiConnect.disabled = true;
+      wifiStatus.textContent = "Saving and connecting...";
+
+      try {
+        const response = await fetch(
+          "/wifi?ssid=" + encodeURIComponent(wanted) +
+          "&password=" + encodeURIComponent(wifiPassInput.value),
+          { cache: "no-store" }
+        );
+
+        if (!response.ok) {
+          const failed = await response.json().catch(() => ({}));
+          throw new Error(failed.error || ("HTTP " + response.status));
+        }
+
+        wifiPassInput.value = "";
+        await watchWifiOutcome(wanted);
+      } catch (error) {
+        wifiStatus.textContent = "Could not save: " + error.message;
+      } finally {
+        wifiConnect.disabled = false;
+      }
+    });
+
     let ledBrightnessTimer = null;
 
     ledBrightnessSlider.addEventListener("input", () => {
+      userAdjustedControls = true;
       const value = clamp255(ledBrightnessSlider.value);
       ledBrightnessValue.textContent = ledBrightnessLabel(value);
 
@@ -4236,6 +5947,285 @@ static esp_err_t index_handler(httpd_req_t *req) {
   );
 }
 
+// A single still, on the control server, so it works while the stream server
+// is busy. The driver hands out the newest frame, so this is whatever the
+// camera is seeing right now.
+static esp_err_t wifi_handler(httpd_req_t *req) {
+  // Room for an SSID and a password, both percent-encoded.
+  char query[320] = {0};
+
+  if (httpd_req_get_url_query_len(req) == 0 ||
+      httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
+    httpd_resp_set_status(req, "400 Bad Request");
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"error\":\"Missing query\"}",
+                           HTTPD_RESP_USE_STRLEN);
+  }
+
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+  char value[96] = {0};
+
+  // /wifi?scan=1 -- a scan uses the same radio as the access point, so this
+  // is a deliberate button in the UI, never something that runs on a timer.
+  if (httpd_query_key_value(query, "scan", value, sizeof(value)) == ESP_OK) {
+    // A scan blocks this server for several seconds, which starves the motion
+    // keepalive and would trip the dead man's switch part-way through a
+    // manoeuvre. Refuse rather than stop the robot out from under someone.
+    if (motionState != MOTION_STOPPED) {
+      httpd_resp_set_status(req, "409 Conflict");
+      return httpd_resp_send(
+        req,
+        "{\"error\":\"Stop the robot before scanning\"}",
+        HTTPD_RESP_USE_STRLEN
+      );
+    }
+
+    setDebugMessage("NET: Scanning for networks");
+
+    // The station cannot scan while it is trying to associate, and after the
+    // boot attempt fails it keeps trying in the background for as long as it
+    // is up -- which is exactly the state the fallback AP leaves it in. Stand
+    // it down first, or every scan comes back empty.
+    bool wasConnected = (WiFi.status() == WL_CONNECTED);
+
+    WiFi.disconnect(false, false);
+    delay(120);
+
+    int found = WiFi.scanNetworks();
+
+    if (found < 0) {
+      // One retry: the first scan after standing the station down sometimes
+      // reports busy rather than a result.
+      WiFi.scanDelete();
+      delay(400);
+      found = WiFi.scanNetworks();
+    }
+
+    // Put the station back to whatever it was doing before.
+    if (wasConnected || ssid[0] != '\0') {
+      WiFi.begin(ssid, password);
+      lastWiFiRetryMs = millis();
+    }
+
+    if (found < 0) {
+      WiFi.scanDelete();
+
+      char dbg[80];
+      snprintf(dbg, sizeof(dbg), "NET: Scan failed with code %d", found);
+      setDebugMessage(dbg);
+
+      char body[96];
+      snprintf(
+        body,
+        sizeof(body),
+        "{\"error\":\"The radio refused the scan (code %d). Try again.\"}",
+        found
+      );
+
+      httpd_resp_set_status(req, "503 Service Unavailable");
+      return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+    }
+
+    if (found > 15) found = 15;
+
+    String body = "{\"networks\":[";
+
+    for (int i = 0; i < found; i++) {
+      char name[64] = {0};
+      WiFi.SSID(i).toCharArray(name, sizeof(name));
+      sanitizeJsonText(name);
+
+      if (name[0] == '\0') continue;
+
+      if (body.endsWith("[") == false) body += ",";
+
+      body += "{\"ssid\":\"";
+      body += name;
+      body += "\",\"rssi\":";
+      body += String((long)WiFi.RSSI(i));
+      body += ",\"secure\":";
+      body += (WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? "false" : "true";
+      body += "}";
+    }
+
+    body += "]}";
+
+    WiFi.scanDelete();
+
+    char dbg[64];
+    snprintf(dbg, sizeof(dbg), "NET: Scan found %d networks", found);
+    setDebugMessage(dbg);
+
+    return httpd_resp_send(req, body.c_str(), body.length());
+  }
+
+  // /wifi?ssid=...&password=...
+  if (httpd_query_key_value(query, "ssid", value, sizeof(value)) == ESP_OK) {
+    urlDecode(value);
+
+    if (value[0] == '\0') {
+      httpd_resp_set_status(req, "400 Bad Request");
+      return httpd_resp_send(req, "{\"error\":\"Empty network name\"}",
+                             HTTPD_RESP_USE_STRLEN);
+    }
+
+    strncpy(ssid, value, sizeof(ssid) - 1);
+    ssid[sizeof(ssid) - 1] = '\0';
+
+    char pass[96] = {0};
+
+    if (httpd_query_key_value(query, "password", pass, sizeof(pass)) == ESP_OK) {
+      urlDecode(pass);
+    }
+
+    strncpy(password, pass, sizeof(password) - 1);
+    password[sizeof(password) - 1] = '\0';
+
+    char dbg[96];
+    snprintf(dbg, sizeof(dbg), "NET: Network set to %s", ssid);
+    setDebugMessage(dbg);
+
+    noteSettingsChanged();
+
+    // Save now rather than on the usual delay: the attempt that follows may
+    // take the radio away mid-write.
+    saveSettings();
+    settingsDirty = false;
+
+    wifiApplyRequested = true;
+
+    return httpd_resp_send(req, "{\"ok\":true,\"applying\":true}",
+                           HTTPD_RESP_USE_STRLEN);
+  }
+
+  httpd_resp_set_status(req, "400 Bad Request");
+  return httpd_resp_send(req, "{\"error\":\"Unknown Wi-Fi request\"}",
+                         HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t capture_handler(httpd_req_t *req) {
+  camera_fb_t *fb = esp_camera_fb_get();
+
+  if (!fb) {
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+  }
+
+  esp_err_t res = ESP_OK;
+
+  httpd_resp_set_type(req, "image/jpeg");
+  httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=robot.jpg");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+  if (fb->format == PIXFORMAT_JPEG) {
+    res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
+    esp_camera_fb_return(fb);
+  } else {
+    uint8_t *jpgBuf = NULL;
+    size_t jpgLen = 0;
+    bool converted = frame2jpg(fb, 80, &jpgBuf, &jpgLen);
+    esp_camera_fb_return(fb);
+
+    if (!converted) {
+      httpd_resp_send_500(req);
+      return ESP_FAIL;
+    }
+
+    res = httpd_resp_send(req, (const char *)jpgBuf, jpgLen);
+    free(jpgBuf);
+  }
+
+  return res;
+}
+
+static esp_err_t program_handler(httpd_req_t *req) {
+  char query[32] = {0};
+  char slot[8] = {0};
+
+  if (httpd_req_get_url_query_len(req) == 0 ||
+      httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
+      httpd_query_key_value(query, "slot", slot, sizeof(slot)) != ESP_OK) {
+    httpd_resp_set_status(req, "400 Bad Request");
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"error\":\"Missing slot\"}",
+                           HTTPD_RESP_USE_STRLEN);
+  }
+
+  char key[16] = {0};
+
+  if (!programSlotKey(slot, key, sizeof(key))) {
+    httpd_resp_set_status(req, "400 Bad Request");
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"error\":\"Slot must be 1, 2 or 3\"}",
+                           HTTPD_RESP_USE_STRLEN);
+  }
+
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+  if (req->method == HTTP_GET) {
+    String stored = "";
+
+    if (settingsStore.begin(SETTINGS_NAMESPACE, true)) {
+      stored = settingsStore.getString(key, "");
+      settingsStore.end();
+    }
+
+    if (stored.length() == 0) stored = "[]";
+
+    return httpd_resp_send(req, stored.c_str(), stored.length());
+  }
+
+  // POST: the body is the program, as the JSON array the browser holds.
+  if (req->content_len == 0 || req->content_len > PROGRAM_SLOT_MAX) {
+    httpd_resp_set_status(req, "413 Payload Too Large");
+    return httpd_resp_send(req, "{\"error\":\"Program too long\"}",
+                           HTTPD_RESP_USE_STRLEN);
+  }
+
+  char *body = (char *)malloc(req->content_len + 1);
+
+  if (!body) {
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+  }
+
+  size_t received = 0;
+
+  while (received < req->content_len) {
+    int chunk = httpd_req_recv(req, body + received, req->content_len - received);
+
+    if (chunk <= 0) {
+      free(body);
+      httpd_resp_send_500(req);
+      return ESP_FAIL;
+    }
+
+    received += chunk;
+  }
+
+  body[received] = '\0';
+
+  bool ok = false;
+
+  if (settingsStore.begin(SETTINGS_NAMESPACE, false)) {
+    ok = settingsStore.putString(key, body) > 0;
+    settingsStore.end();
+  }
+
+  free(body);
+
+  char dbg[64];
+  snprintf(dbg, sizeof(dbg), "PROGRAM: Slot %s %s", slot,
+           ok ? "saved" : "could not be saved");
+  setDebugMessage(dbg);
+
+  return httpd_resp_send(req, ok ? "{\"ok\":true}" : "{\"ok\":false}",
+                         HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t stream_handler(httpd_req_t *req) {
   camera_fb_t *fb = NULL;
   esp_err_t res = ESP_OK;
@@ -4342,6 +6332,32 @@ static esp_err_t stream_handler(httpd_req_t *req) {
   setDebugMessage(endDbg);
 
   return res;
+}
+
+// httpd_query_key_value() hands back the raw query value, so anything the
+// browser encoded is still encoded. A Wi-Fi password full of %40 and + is
+// not the password.
+static void urlDecode(char *text) {
+  if (!text) return;
+
+  char *read = text;
+  char *write = text;
+
+  while (*read) {
+    if (*read == '%' && isxdigit((unsigned char)read[1]) &&
+        isxdigit((unsigned char)read[2])) {
+      char hex[3] = { read[1], read[2], '\0' };
+      *write++ = (char)strtol(hex, NULL, 16);
+      read += 3;
+    } else if (*read == '+') {
+      *write++ = ' ';
+      read++;
+    } else {
+      *write++ = *read++;
+    }
+  }
+
+  *write = '\0';
 }
 
 static void sanitizeJsonText(char *text) {
@@ -4459,6 +6475,10 @@ static esp_err_t status_handler(httpd_req_t *req) {
     "\"streamActive\":%s,"
     "\"streamFps10\":%lu,"
     "\"streamDrops\":%lu,"
+    "\"robotName\":\"%s\","
+    "\"maxPwm\":%d,"
+    "\"leftThreshold\":%d,"
+    "\"rightThreshold\":%d,"
     "\"build\":\"%s %s\","
     "\"message\":\"%s\","
     "\"latestEventId\":%lu,"
@@ -4481,6 +6501,10 @@ static esp_err_t status_handler(httpd_req_t *req) {
     streamClientActive ? "true" : "false",
     (unsigned long)streamFps10,
     (unsigned long)streamDropCount,
+    robotName,
+    maxMotorPWM,
+    leftThreshold,
+    rightThreshold,
     __DATE__,
     __TIME__,
     messageCopy,
@@ -4697,6 +6721,7 @@ static esp_err_t camera_handler(httpd_req_t *req) {
     }
 
     setDebugMessage("CAMERA: Settings reset to defaults");
+    noteSettingsChanged();
     return sendCameraStatus(req);
   }
 
@@ -4817,6 +6842,7 @@ static esp_err_t camera_handler(httpd_req_t *req) {
   }
 
   setDebugMessage(dbg);
+  noteSettingsChanged();
   return sendCameraStatus(req);
 }
 
@@ -4993,6 +7019,7 @@ static esp_err_t action_handler(httpd_req_t *req) {
   // /action?leftSpeed=0-255
   if (httpd_query_key_value(query, "leftSpeed", value, sizeof(value)) == ESP_OK) {
     leftMotorSpeed = constrain(atoi(value), MIN_PWM, MAX_PWM);
+    noteSettingsChanged();
 
     char dbg[96];
     snprintf(dbg, sizeof(dbg), "Left speed set to %d / 255", leftMotorSpeed);
@@ -5009,6 +7036,7 @@ static esp_err_t action_handler(httpd_req_t *req) {
   // /action?rightSpeed=0-255
   if (httpd_query_key_value(query, "rightSpeed", value, sizeof(value)) == ESP_OK) {
     rightMotorSpeed = constrain(atoi(value), MIN_PWM, MAX_PWM);
+    noteSettingsChanged();
 
     char dbg[96];
     snprintf(dbg, sizeof(dbg), "Right speed set to %d / 255", rightMotorSpeed);
@@ -5030,6 +7058,7 @@ static esp_err_t action_handler(httpd_req_t *req) {
         sizeof(value)
       ) == ESP_OK) {
     ledBrightness = clampLedPWM(atoi(value));
+    noteSettingsChanged();
     applyLedOutput();
 
     char dbg[96];
@@ -5048,6 +7077,7 @@ static esp_err_t action_handler(httpd_req_t *req) {
   // Flash LED: /action?led=on|off
   if (httpd_query_key_value(query, "led", value, sizeof(value)) == ESP_OK) {
     ledEnabled = (strcmp(value, "on") == 0);
+    noteSettingsChanged();
     applyLedOutput();
 
     char dbg[96];
@@ -5060,6 +7090,62 @@ static esp_err_t action_handler(httpd_req_t *req) {
     );
     setDebugMessage(dbg);
 
+    httpd_resp_send(req, "", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+  }
+
+  // Robot name: /action?robotName=<text>
+  if (httpd_query_key_value(query, "robotName", value, sizeof(value)) == ESP_OK) {
+    // The query value arrives percent-encoded for anything unusual; the UI
+    // only offers plain characters, so trim and store as-is.
+    urlDecode(value);
+    strncpy(robotName, value, sizeof(robotName) - 1);
+    robotName[sizeof(robotName) - 1] = '\0';
+    sanitizeJsonText(robotName);
+
+    if (robotName[0] == '\0') {
+      strncpy(robotName, "ESP32-CAM Robot", sizeof(robotName) - 1);
+    }
+
+    char dbg[80];
+    snprintf(dbg, sizeof(dbg), "SETTINGS: Robot name is now %s", robotName);
+    setDebugMessage(dbg);
+
+    noteSettingsChanged();
+    httpd_resp_send(req, "", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+  }
+
+  // Speed ceiling: /action?maxPwm=1-255
+  if (httpd_query_key_value(query, "maxPwm", value, sizeof(value)) == ESP_OK) {
+    maxMotorPWM = constrain(atoi(value), 1, MAX_PWM);
+
+    // Anything already above the new ceiling comes down to it.
+    leftMotorSpeed = clampMotorPWM(leftMotorSpeed);
+    rightMotorSpeed = clampMotorPWM(rightMotorSpeed);
+
+    if (motionState != MOTION_STOPPED) applyMotion();
+
+    char dbg[80];
+    snprintf(dbg, sizeof(dbg), "SETTINGS: Speed limit set to %d / 255", maxMotorPWM);
+    setDebugMessage(dbg);
+
+    noteSettingsChanged();
+    httpd_resp_send(req, "", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+  }
+
+  // Measured motor thresholds: /action?leftThreshold=0-255
+  if (httpd_query_key_value(query, "leftThreshold", value, sizeof(value)) == ESP_OK) {
+    leftThreshold = constrain(atoi(value), 0, MAX_PWM);
+    noteSettingsChanged();
+    httpd_resp_send(req, "", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+  }
+
+  if (httpd_query_key_value(query, "rightThreshold", value, sizeof(value)) == ESP_OK) {
+    rightThreshold = constrain(atoi(value), 0, MAX_PWM);
+    noteSettingsChanged();
     httpd_resp_send(req, "", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
   }
@@ -5113,6 +7199,9 @@ static esp_err_t action_handler(httpd_req_t *req) {
 void startCameraServer() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 80;
+  // The control server now registers eight routes, which is the default
+  // ceiling exactly; the next one added would fail silently.
+  config.max_uri_handlers = 12;
   // Browsers that walk away mid-request leave sockets behind; reclaim the
   // least recently used one instead of refusing the next connection.
   config.lru_purge_enable = true;
@@ -5145,6 +7234,34 @@ void startCameraServer() {
     .user_ctx = NULL
   };
 
+  httpd_uri_t wifi_uri = {
+    .uri = "/wifi",
+    .method = HTTP_GET,
+    .handler = wifi_handler,
+    .user_ctx = NULL
+  };
+
+  httpd_uri_t capture_uri = {
+    .uri = "/capture",
+    .method = HTTP_GET,
+    .handler = capture_handler,
+    .user_ctx = NULL
+  };
+
+  httpd_uri_t program_get_uri = {
+    .uri = "/program",
+    .method = HTTP_GET,
+    .handler = program_handler,
+    .user_ctx = NULL
+  };
+
+  httpd_uri_t program_post_uri = {
+    .uri = "/program",
+    .method = HTTP_POST,
+    .handler = program_handler,
+    .user_ctx = NULL
+  };
+
   httpd_uri_t update_uri = {
     .uri = "/update",
     .method = HTTP_POST,
@@ -5164,6 +7281,10 @@ void startCameraServer() {
     httpd_register_uri_handler(camera_httpd, &cmd_uri);
     httpd_register_uri_handler(camera_httpd, &status_uri);
     httpd_register_uri_handler(camera_httpd, &camera_uri);
+    httpd_register_uri_handler(camera_httpd, &wifi_uri);
+    httpd_register_uri_handler(camera_httpd, &capture_uri);
+    httpd_register_uri_handler(camera_httpd, &program_get_uri);
+    httpd_register_uri_handler(camera_httpd, &program_post_uri);
     httpd_register_uri_handler(camera_httpd, &update_uri);
   }
 

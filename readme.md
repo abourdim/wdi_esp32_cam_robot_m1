@@ -181,6 +181,10 @@ until you want them.
 
 **Camera** -- the camera controls listed above.
 
+**Robot** -- name, speed limit, and the measured wake-up numbers.
+
+**Wi-Fi** -- scan for networks and join one.
+
 **USB Serial console**
 
 - Serial baud selector
@@ -224,6 +228,127 @@ Shows:
 - Clear debug log
 
 Newest debug events are shown at the top.
+
+## Record and replay
+
+The header has two views of the same column, **Drive** and **Program**. The
+video stays above both, so a program can be watched while it runs.
+
+Press **Record**, drive the robot by hand, press **Stop**. What you did is now
+a list of instructions in the Program view:
+
+```
+1   0.0s   Forward
+2   1.4s   Stop
+3   0.6s   Right
+4   0.5s   Stop
+```
+
+Press **Play** and the robot does it again. Change a pause, delete a line,
+play it again -- that is the whole point. A child drives first and reads their
+own program second, which is a gentler route into programming than starting
+from an empty editor.
+
+Three slots keep programs **on the robot**, not in the browser, so a program
+follows the robot round the classroom rather than the tablet that recorded it.
+The robot does not replay on its own yet -- a browser still has to press Play.
+
+### How it works, and why it is safe
+
+Every command the page sends already passes through the same three functions,
+so a recording is just those calls with the pause before each one written
+down. Playback calls the same functions -- which means a replayed drive sends
+the same 250 ms keepalives a held button does, and is governed by the same
+600 ms motion timeout. A program cannot drive the robot in a way a child
+could not.
+
+It stops on **Stop**, on leaving the page, on switching tabs, and on the
+window losing focus. A replay that is interrupted always sends a stop.
+
+Repeats are not recorded as steps: a held button repeats itself four times a
+second and a dragged slider fires continuously, and neither is a new
+instruction.
+
+## Photos
+
+**Photo** on the strip under the video grabs a single frame from `/capture`
+and adds it to **Photos**, where each one has a Save button. They live in the
+browser for the session only; saving is how one is kept. A few VGA stills
+would be most of a browser's storage quota, so they are deliberately not
+persisted.
+
+`/capture` is served by the control server on port 80, so it answers while the
+stream server on 81 is busy, and it returns whatever the camera is seeing at
+that moment.
+
+## Find the wake-up number
+
+Settings -> Robot -> **Measure them** starts a guided activity. It powers one
+wheel at a time, starting at 20 out of 255 and stepping up by 5, and asks
+whether the wheel is turning. When the child says it is, that number is the
+motor's starting threshold, and it is saved on the robot.
+
+The two motors will disagree, often by 20 or 30. That difference is the lesson:
+identical parts are not identical, and it is why the robot pulls to one side.
+
+Because there is one MOSFET per motor, a single wheel is driven by *steering*:
+testing the left wheel means turning right. The activity hides that. It also
+restores the driving speeds it found when it started, so a class does not end
+up wondering why the robot got slow.
+
+## Robot name and speed limit
+
+Settings -> Robot:
+
+- **Name** -- shown in the header and the browser tab, and used for photo and
+  log filenames. Stored on the robot, so every browser sees the same name.
+- **Speed limit** -- a ceiling on motor PWM, enforced in the firmware rather
+  than the browser, so it holds however the command arrives. The startup kick
+  respects it too. Anything already above a new ceiling is brought down to it
+  immediately.
+
+## Saved settings
+
+Settings are split by who owns them.
+
+### On the robot, in flash
+
+Camera resolution, JPEG quality, brightness, contrast, saturation, flip and
+mirror; motor speeds; LED brightness and on/off. These describe the robot, not
+your browser, so they live in NVS and come back after a power cycle.
+
+Putting them in the browser instead would break in two ways: a phone and a
+laptop would restore two different sets of values and overwrite each other,
+and a robot rebooted without the right browser open would come back on
+firmware defaults.
+
+Writes are **held for four seconds after the last change**. The camera and
+motor controls send on every slider movement, and committing to flash at that
+rate would be hundreds of writes for one drag.
+
+A resolution saved on a board with PSRAM is not restored onto a board without
+it; the allocation would fail and take the stream with it.
+
+### In the browser, in localStorage
+
+Display rotation, serial baud, terminal auto-scroll, and which Settings
+sections are open. Per-viewer preferences the robot has no opinion about.
+
+The section state is saved when you click a section header, not when the
+`<details>` element toggles. Browsers reinstate `<details>` state from session
+history after the page loads, and saving on the toggle event would record the
+browser's restoration instead of your choice.
+
+### Never saved
+
+The OTA password.
+
+### The page no longer overwrites the robot
+
+The page used to send its own slider defaults to the robot on every load, so
+opening a second tab reset the motor speeds and the LED under whoever was
+driving. It now reads all three from the robot and adopts them, and never
+overwrites a control you have already touched in that session.
 
 ## Editing the web UI
 
@@ -300,6 +425,36 @@ Then open:
 `http://localhost:8000/ESP32_Robot_USB_Serial_Console.html`
 
 in Chrome or Edge.
+
+## Choosing a network
+
+The credentials in the sketch are only defaults, used the first time. A network
+picked in **Settings -> Wi-Fi** is stored on the robot, so moving it between a
+workshop and a classroom no longer means reflashing it.
+
+1. Connect to the robot's fallback AP and open `192.168.4.1`.
+2. Settings -> Wi-Fi -> **Scan for networks**.
+3. Pick one from the list, type the password, **Save and connect**.
+4. The page watches for the outcome and reports the new address.
+
+The access point stays up throughout, including while the attempt is running
+and after it fails, so it is not possible to lock yourself out of the robot
+from the robot's own interface.
+
+Some things worth knowing:
+
+- **A scan disturbs the video.** The scan and the access point share one
+  radio. That is why scanning is a button and never something on a timer, and
+  why the robot **refuses to scan while it is moving** -- a scan blocks the
+  control server for several seconds, which would starve the motion keepalive
+  and trip the safety timeout mid-manoeuvre.
+- **Joining a network may drop you briefly**, because it moves the radio to
+  that network's channel.
+- **The password is stored in plain text** and travels over the AP link. The
+  AP is WPA2, but its passphrase is in this readme. Treat this as convenience,
+  not security.
+- The attempt runs from the main loop rather than inside the request, because
+  the reply has to leave before the radio moves.
 
 ## Wi-Fi behavior
 
