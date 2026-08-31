@@ -56,6 +56,7 @@
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 #include "esp_http_server.h"
+#include "esp_wifi.h"
 #include <Update.h>
 
 // Gzipped copy of the INDEX_HTML literal further down this file,
@@ -72,6 +73,9 @@ const char *password = "err_Safia080707";  // Set to your Wi-Fi passwords
 static const char *FALLBACK_AP_PASSWORD = "88888888";
 static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 10000;
 static const uint32_t WIFI_RETRY_INTERVAL_MS = 30000;
+// Retries back off up to this, so a robot left on a network that is not
+// coming back stops scanning every 30 seconds and filling the event log.
+static const uint32_t WIFI_RETRY_MAX_INTERVAL_MS = 300000;
 
 // Motion safety
 // Every motion command refreshes a deadline, and a held direction button in
@@ -91,6 +95,8 @@ volatile bool otaInProgress = false;
 char fallbackApSsid[32] = "";
 bool fallbackApActive = false;
 unsigned long lastWiFiRetryMs = 0;
+static uint32_t wifiRetryIntervalMs = WIFI_RETRY_INTERVAL_MS;
+static bool wifiRetryPaused = false;
 wl_status_t previousStaStatus = WL_IDLE_STATUS;
 
 // Camera pins
@@ -384,17 +390,61 @@ static void serviceWiFiFallback() {
     previousStaStatus = currentStatus;
   }
 
-  // Periodically retry the configured Wi-Fi while preserving the AP.
-  if (currentStatus != WL_CONNECTED &&
-      millis() - lastWiFiRetryMs >= WIFI_RETRY_INTERVAL_MS) {
+  if (currentStatus == WL_CONNECTED) {
+    // Back on the configured network. Start from the short interval again if
+    // it is ever lost.
+    wifiRetryIntervalMs = WIFI_RETRY_INTERVAL_MS;
+    wifiRetryPaused = false;
+    return;
+  }
+
+  // The AP and the station share one radio and one channel, and the station
+  // is the one that picks it. Reconnecting means a scan and an association,
+  // which stalls AP traffic for a second or two and can throw AP clients off
+  // altogether -- it was cutting the video and swallowing motor commands
+  // every 30 seconds. Someone driving the robot over the fallback AP is
+  // exactly who should not be interrupted to go looking for another network.
+  if (WiFi.softAPgetStationNum() > 0) {
+    if (!wifiRetryPaused) {
+      wifiRetryPaused = true;
+      setDebugMessage(
+        "NET: Wi-Fi retry paused while the fallback AP is in use"
+      );
+    }
+
+    // Hold the deadline open, or the retry fires the instant the last client
+    // leaves rather than after a full interval.
     lastWiFiRetryMs = millis();
+    return;
+  }
+
+  if (wifiRetryPaused) {
+    wifiRetryPaused = false;
+
+    // Start from the short interval again. Someone who disconnects from the
+    // fallback AP to let the robot rejoin the normal network should not have
+    // to wait out a five-minute backoff earned before they arrived.
+    wifiRetryIntervalMs = WIFI_RETRY_INTERVAL_MS;
+
+    setDebugMessage("NET: Fallback AP idle; resuming Wi-Fi retries");
+  }
+
+  // Periodically retry the configured Wi-Fi while preserving the AP.
+  if (millis() - lastWiFiRetryMs >= wifiRetryIntervalMs) {
+    lastWiFiRetryMs = millis();
+
+    wifiRetryIntervalMs *= 2;
+    if (wifiRetryIntervalMs > WIFI_RETRY_MAX_INTERVAL_MS) {
+      wifiRetryIntervalMs = WIFI_RETRY_MAX_INTERVAL_MS;
+    }
 
     char dbg[160];
     snprintf(
       dbg,
       sizeof(dbg),
-      "NET: Retrying configured Wi-Fi; previous status: %s",
-      wifiStatusName(currentStatus)
+      "NET: Retrying configured Wi-Fi; previous status: %s; next in %lus",
+      wifiStatusName(currentStatus),
+      (unsigned long)(wifiRetryIntervalMs / 1000)
     );
     setDebugMessage(dbg);
 
@@ -423,6 +473,10 @@ static volatile bool streamClientActive = false;
 // Measured frame rate of the live stream, in tenths of a frame per second, so
 // the debug panel can show whether the video is actually keeping up.
 static volatile uint32_t streamFps10 = 0;
+
+// How many streams have ended since boot. A viewer coming and going is
+// normal; a number that climbs on its own is a link that keeps dropping.
+static volatile uint32_t streamDropCount = 0;
 
 void startCameraServer();
 static void checkIndexGzAsset();
@@ -473,6 +527,36 @@ static void applyLedOutput() {
 // exception.
 //
 // So the slow pulse now means what it should: nobody is there.
+// Signal strength of whichever link the browser is actually using. In station
+// mode that is WiFi.RSSI(); on the fallback AP the station RSSI is meaningless
+// and the useful number is how well the AP hears its client -- which is what
+// tells a driver they are running out of range.
+static bool currentLinkRssi(long *rssi) {
+  if (!rssi) return false;
+
+  if (WiFi.status() == WL_CONNECTED) {
+    *rssi = (long)WiFi.RSSI();
+    return true;
+  }
+
+  wifi_sta_list_t stations;
+
+  if (esp_wifi_ap_get_sta_list(&stations) != ESP_OK || stations.num == 0) {
+    return false;
+  }
+
+  // Strongest client: with one viewer that is the viewer, and with several it
+  // is the most optimistic reading rather than a misleading worst case.
+  int best = -127;
+
+  for (int i = 0; i < stations.num; i++) {
+    if (stations.sta[i].rssi > best) best = stations.sta[i].rssi;
+  }
+
+  *rssi = (long)best;
+  return true;
+}
+
 static bool robotIsLinked() {
   if (WiFi.status() == WL_CONNECTED) return true;
   return WiFi.softAPgetStationNum() > 0;
@@ -563,6 +647,10 @@ static void applyMotion() {
 // millis() of the last motion command from the browser.
 static volatile uint32_t lastMotionCommandMs = 0;
 
+// How many times the dead man's switch has fired. The browser watches this so
+// it can say why the robot stopped, rather than leaving it a mystery.
+static volatile uint32_t motionTimeoutCount = 0;
+
 static void noteMotionCommand() {
   lastMotionCommandMs = millis();
 }
@@ -596,6 +684,7 @@ static void serviceMotionTimeout() {
   if (motionState == MOTION_STOPPED) return;
   if (millis() - lastMotionCommandMs < MOTION_TIMEOUT_MS) return;
 
+  motionTimeoutCount++;
   setDebugMessage("SAFETY: motion timeout; motors stopped");
   commandStop();
 }
@@ -1049,6 +1138,180 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
   <style>
     * { box-sizing: border-box; }
 
+    .svg-defs {
+      position: absolute;
+      width: 0;
+      height: 0;
+      overflow: hidden;
+    }
+
+    /* Above the sidebars on purpose: they slide underneath, so the pill that
+       opened one is still there to close it. */
+    .hero {
+      position: sticky;
+      top: 0;
+      z-index: 1100;
+      margin: -18px -12px 14px;
+      padding: 9px 12px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.10);
+      border-radius: 0 0 16px 16px;
+      background: linear-gradient(180deg, rgba(26, 37, 66, 0.94), rgba(15, 23, 42, 0.90));
+      backdrop-filter: blur(8px);
+      box-shadow: 0 10px 26px rgba(0, 0, 0, 0.22);
+    }
+
+    .hero-inner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      width: min(1100px, 100%);
+      margin: 0 auto;
+      text-align: left;
+    }
+
+    .hero-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    .hero-logo {
+      flex: 0 0 auto;
+      width: 44px;
+      height: 24px;
+    }
+
+    .hero-titles {
+      min-width: 0;
+    }
+
+    .hero-title {
+      background: linear-gradient(90deg, #38bdf8, #7dd3fc);
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+      font-size: 17px;
+      font-weight: 900;
+      letter-spacing: 0.01em;
+      line-height: 1.15;
+      white-space: nowrap;
+    }
+
+    .hero-subtitle {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      color: rgba(248, 250, 252, 0.6);
+      font-size: 11px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    .hero-badge {
+      padding: 1px 7px;
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.10);
+      color: rgba(248, 250, 252, 0.65);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+    }
+
+    .hero-right {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .hero-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      min-height: 38px;
+      padding: 7px 13px;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.05);
+      color: rgba(248, 250, 252, 0.92);
+      font-size: 13px;
+      font-weight: 700;
+      font-family: inherit;
+      cursor: pointer;
+    }
+
+    .hero-pill:hover {
+      background: rgba(255, 255, 255, 0.10);
+    }
+
+    .pill-icon {
+      font-size: 15px;
+      line-height: 1;
+    }
+
+    .pill-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: rgba(248, 250, 252, 0.45);
+    }
+
+    /* Not a button: it reports, it does not act. */
+    .hero-link {
+      cursor: default;
+    }
+
+    .hero-link.is-live .pill-dot {
+      background: #34d399;
+      box-shadow: 0 0 8px rgba(52, 211, 153, 0.8);
+    }
+
+    .hero-link.is-novideo .pill-dot {
+      background: #fbbf24;
+      box-shadow: 0 0 8px rgba(251, 191, 36, 0.7);
+    }
+
+    .hero-link.is-offline {
+      border-color: rgba(248, 113, 113, 0.55);
+      background: linear-gradient(135deg, rgba(248, 113, 113, 0.30), rgba(239, 68, 68, 0.30));
+      color: #fee2e2;
+    }
+
+    .hero-link.is-offline .pill-dot {
+      background: #f87171;
+      animation: linkPulse 1.4s ease-in-out infinite;
+    }
+
+    @keyframes linkPulse {
+      0%, 100% { opacity: 1; }
+      50%      { opacity: 0.25; }
+    }
+
+    /* Phones: the labels go, the icons and the link dot stay. */
+    @media (max-width: 560px) {
+      .hero-pill .pill-text {
+        display: none;
+      }
+
+      .hero-link .pill-text {
+        display: inline;
+        font-size: 12px;
+      }
+
+      .hero-pill {
+        padding: 7px 11px;
+      }
+
+      .hero-title {
+        font-size: 15px;
+      }
+
+      .hero-subtitle {
+        font-size: 10px;
+      }
+    }
+
     body {
       font-family: Arial, sans-serif;
       text-align: center;
@@ -1058,10 +1321,6 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       color: #172033;
     }
 
-    h1 {
-      margin: 0 0 12px;
-      font-size: clamp(25px, 5vw, 38px);
-    }
 
     .robot {
       width: min(620px, 100%);
@@ -1079,10 +1338,94 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       transition: aspect-ratio 0.18s ease;
     }
 
+    /* Overlays sit alongside #photo rather than on it: applyImageRotation()
+       transforms the image only, so these stay upright at every rotation. */
+    /* Positioning belongs to .video-footer: these are flex children of it,
+       and absolutely positioning them stacks them on top of each other. */
+    .video-overlay {
+      display: flex;
+      min-width: 0;
+      align-items: center;
+      gap: 7px;
+      padding: 4px 9px;
+      border-radius: 8px;
+      background: rgba(17, 17, 17, 0.55);
+      color: #e5e7eb;
+      font-size: 12px;
+      line-height: 1.2;
+      pointer-events: none;
+    }
+
+    /* One bar across the bottom, so the mark and the readouts can never
+       overlap however narrow the frame gets. */
+    .video-footer {
+      position: absolute;
+      right: 8px;
+      bottom: 8px;
+      left: 8px;
+      z-index: 2;
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 8px;
+      pointer-events: none;
+    }
+
+    .video-brand {
+      letter-spacing: 0.02em;
+      /* A watermark, not a readout: present, never competing. */
+      opacity: 0.3;
+    }
+
+    .brand-logo {
+      display: block;
+      flex: 0 0 auto;
+      /* Both dimensions explicit. The viewBox lives on the <symbol> now, so
+         this element has no intrinsic aspect ratio and height:auto would
+         resolve to the 150px default for a replaced element -- which makes
+         the pill 150px tall and lifts the wordmark off the footer line.
+         34 x 18 keeps the mark's own 1.87 ratio. */
+      width: 34px;
+      height: 18px;
+    }
+
+    .video-telemetry {
+      gap: 10px;
+      font-variant-numeric: tabular-nums;
+      opacity: 0.3;
+      transition: opacity 0.18s ease;
+    }
+
+    /* Dim at rest, legible the moment it has something to say: the robot is
+       moving, the signal is going, or the motors just timed out. */
+    .video-telemetry.is-awake {
+      opacity: 1;
+    }
+
+    #videoRssi.is-weak {
+      color: #fbbf24;
+    }
+
+    #videoMotion.is-moving {
+      color: #7dd3fc;
+    }
+
+    #videoMotion.is-timeout {
+      color: #f87171;
+      font-weight: 700;
+    }
+
+    /* On a narrow frame the wordmark goes and the logo stays. */
+    @media (max-width: 430px) {
+      .video-brand span {
+        display: none;
+      }
+    }
+
     .stream-status {
       position: absolute;
       left: 8px;
-      bottom: 8px;
+      top: 8px;
       z-index: 2;
       max-width: calc(100% - 16px);
       padding: 4px 8px;
@@ -1281,21 +1624,6 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       line-height: 1.35;
     }
 
-    .settings-toggle {
-      position: fixed;
-      top: 14px;
-      left: 14px;
-      z-index: 1100;
-      min-width: 48px;
-      height: 44px;
-      padding: 0 12px;
-      border: 0;
-      border-radius: 12px;
-      background: #172033;
-      color: white;
-      font-size: 20px;
-      cursor: pointer;
-    }
 
     .settings-sidebar {
       position: fixed;
@@ -1331,9 +1659,35 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       background: white;
     }
 
-    .settings-section h3 {
-      margin: 0 0 12px;
+    .settings-section > summary {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
       font-size: 16px;
+      font-weight: 700;
+      cursor: pointer;
+      /* The default marker cannot be positioned; this section uses its own. */
+      list-style: none;
+    }
+
+    .settings-section > summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .settings-section > summary::after {
+      content: "▾";
+      color: #667085;
+      font-size: 12px;
+      transition: transform 0.18s ease;
+    }
+
+    .settings-section[open] > summary {
+      margin-bottom: 12px;
+    }
+
+    .settings-section[open] > summary::after {
+      transform: rotate(180deg);
     }
 
     .setting-row {
@@ -1528,21 +1882,6 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       line-height: 1.5;
     }
 
-    .debug-toggle {
-      position: fixed;
-      top: 14px;
-      right: 14px;
-      z-index: 1100;
-      min-width: 48px;
-      height: 44px;
-      padding: 0 12px;
-      border: 0;
-      border-radius: 12px;
-      background: #172033;
-      color: white;
-      font-size: 20px;
-      cursor: pointer;
-    }
 
     .debug-sidebar {
       position: fixed;
@@ -1650,10 +1989,10 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       cursor: pointer;
     }
 
+    /* The OTA card lives inside a settings-section, which already draws the
+       white card and its border. */
     .ota-panel {
-      padding: 12px;
-      border-radius: 12px;
-      background: #0b1220;
+      padding: 0;
     }
 
     .ota-build {
@@ -1665,14 +2004,14 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     }
 
     .ota-build span {
-      color: #94a3b8;
+      color: #667085;
     }
 
     .ota-label,
     .ota-file-label {
       display: block;
       margin: 9px 0 5px;
-      color: #cbd5e1;
+      color: #475569;
       font-size: 12px;
       font-weight: 700;
     }
@@ -1681,10 +2020,10 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     .ota-file {
       width: 100%;
       min-height: 40px;
-      border: 1px solid #475569;
+      border: 1px solid #cbd5e1;
       border-radius: 8px;
-      background: #111827;
-      color: #f8fafc;
+      background: white;
+      color: #172033;
       padding: 8px 9px;
       font-size: 16px;
     }
@@ -1717,19 +2056,19 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       margin-top: 10px;
       overflow: hidden;
       border-radius: 999px;
-      background: #1f2937;
+      background: #e2e8f0;
     }
 
     .ota-progress-bar {
       width: 0%;
       height: 100%;
-      background: #cbd5e1;
+      background: #334155;
       transition: width 0.12s linear;
     }
 
     .ota-progress-text {
       margin-top: 7px;
-      color: #cbd5e1;
+      color: #475569;
       font-family: monospace;
       font-size: 12px;
       overflow-wrap: anywhere;
@@ -1737,7 +2076,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
 
     .ota-warning {
       margin-top: 9px;
-      color: #fbbf24;
+      color: #b45309;
       font-size: 11px;
       line-height: 1.4;
     }
@@ -1789,15 +2128,66 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
 </head>
 
 <body>
-  <button id="settingsToggle" class="settings-toggle" type="button"
-          aria-controls="settingsSidebar" aria-expanded="false"
-          title="Open settings">⚙</button>
+  <!-- The workshop-diy mark, defined once and referenced by both the header
+       and the video watermark: two inline copies would cost 3.5 KB twice. -->
+  <svg class="svg-defs" aria-hidden="true" focusable="false">
+    <symbol id="wdiLogo" viewBox="-92.820084 179.975632 6.000000 3.214096">
+      <path style="stroke:none;fill:#007BFF;fill-rule:evenodd" d="M-90.27,180.71C-90.27,180.7,-90.28,180.55,-90.29,180.38C-90.3,180.2,-90.32,180.04,-90.32,180.03L-90.32,180.01L-90.3,180.01C-90.28,180.01,-90.26,180.01,-90.24,180.01C-90.22,180.01,-90.19,180.01,-90.17,180L-90.14,180L-90.13,180.13C-90.12,180.2,-90.12,180.27,-90.12,180.28L-90.12,180.3L-90.05,180.21C-90.02,180.15,-89.98,180.08,-89.96,180.05L-89.92,179.99L-89.88,179.99C-89.86,179.98,-89.82,179.98,-89.8,179.98C-89.77,179.98,-89.74,179.97,-89.73,179.98L-89.71,179.98L-89.83,180.15L-89.94,180.32L-89.8,180.49C-89.72,180.59,-89.66,180.67,-89.66,180.67C-89.66,180.67,-89.66,180.67,-89.66,180.67C-89.68,180.67,-89.86,180.68,-89.86,180.69C-89.87,180.69,-89.9,180.65,-89.97,180.55C-90.03,180.48,-90.08,180.42,-90.08,180.42C-90.08,180.42,-90.09,180.43,-90.09,180.45L-90.11,180.47L-90.1,180.58C-90.09,180.67,-90.09,180.7,-90.09,180.7C-90.1,180.7,-90.14,180.71,-90.21,180.71C-90.26,180.71,-90.27,180.71,-90.27,180.71z"/>
+      <path style="stroke:none;fill:#007BFF;fill-rule:evenodd" d="M-89.19,180.77C-89.27,180.75,-89.31,180.74,-89.36,180.72C-89.39,180.7,-89.47,180.65,-89.48,180.64C-89.48,180.64,-89.48,180.63,-89.45,180.49C-89.44,180.47,-89.43,180.47,-89.4,180.5C-89.35,180.57,-89.27,180.62,-89.19,180.64C-89.15,180.64,-89.15,180.64,-89.13,180.64C-89.09,180.62,-89.08,180.6,-89.08,180.57C-89.09,180.54,-89.12,180.51,-89.18,180.48C-89.25,180.45,-89.28,180.43,-89.31,180.4C-89.37,180.35,-89.38,180.29,-89.37,180.22C-89.35,180.14,-89.3,180.08,-89.21,180.06C-89.17,180.05,-89.1,180.05,-89.05,180.06C-88.98,180.07,-88.91,180.1,-88.84,180.15C-88.81,180.17,-88.81,180.17,-88.81,180.18C-88.81,180.19,-88.82,180.22,-88.83,180.26C-88.85,180.32,-88.85,180.33,-88.86,180.32C-88.86,180.32,-88.87,180.32,-88.87,180.31C-88.89,180.3,-88.93,180.25,-88.95,180.24C-89,180.2,-89.07,180.18,-89.11,180.19C-89.17,180.19,-89.2,180.23,-89.18,180.27C-89.17,180.28,-89.14,180.3,-89.08,180.34C-88.98,180.39,-88.92,180.43,-88.9,180.49C-88.89,180.51,-88.89,180.57,-88.89,180.6C-88.92,180.71,-89.01,180.77,-89.14,180.77C-89.16,180.77,-89.18,180.77,-89.19,180.77z"/>
+      <path style="stroke:none;fill:#007BFF;fill-rule:evenodd" d="M-91.1,180.9C-91.13,180.83,-91.2,180.69,-91.25,180.59C-91.29,180.48,-91.33,180.39,-91.33,180.39C-91.33,180.39,-91.25,180.35,-91.14,180.3C-91.08,180.28,-91.02,180.25,-91,180.25C-90.92,180.22,-90.85,180.23,-90.8,180.28C-90.78,180.3,-90.76,180.33,-90.74,180.37C-90.73,180.4,-90.73,180.41,-90.73,180.44C-90.73,180.47,-90.73,180.49,-90.74,180.51C-90.75,180.54,-90.77,180.57,-90.78,180.58C-90.78,180.58,-90.79,180.59,-90.79,180.59C-90.79,180.59,-90.75,180.61,-90.58,180.7C-90.52,180.73,-90.47,180.76,-90.46,180.76C-90.45,180.77,-90.46,180.77,-90.55,180.81C-90.6,180.83,-90.65,180.85,-90.65,180.85C-90.65,180.85,-90.72,180.82,-90.8,180.78L-90.93,180.7L-90.96,180.71C-90.97,180.72,-90.99,180.72,-90.99,180.72C-90.99,180.72,-90.97,180.78,-90.94,180.84C-90.91,180.9,-90.89,180.95,-90.89,180.95C-90.89,180.96,-90.91,180.97,-90.96,180.99C-91.01,181.01,-91.04,181.03,-91.04,181.03C-91.05,181.03,-91.07,180.97,-91.1,180.9zM-90.99,180.59C-90.93,180.55,-90.9,180.53,-90.9,180.49C-90.9,180.45,-90.93,180.41,-90.95,180.4C-90.98,180.38,-91.01,180.39,-91.07,180.42C-91.1,180.43,-91.11,180.44,-91.12,180.44C-91.12,180.44,-91.04,180.61,-91.04,180.61C-91.04,180.61,-91.02,180.6,-90.99,180.59z"/>
+      <path style="stroke:none;fill:#007BFF;fill-rule:evenodd" d="M-88.33,181.18C-88.37,181.15,-88.4,181.13,-88.4,181.13C-88.4,181.13,-88.36,181.07,-88.31,181C-88.27,180.93,-88.23,180.88,-88.23,180.87C-88.23,180.87,-88.36,180.78,-88.4,180.75L-88.42,180.74L-88.51,180.87C-88.55,180.94,-88.59,180.99,-88.6,180.99C-88.6,180.99,-88.74,180.9,-88.74,180.89C-88.74,180.89,-88.56,180.63,-88.38,180.37C-88.36,180.35,-88.34,180.32,-88.34,180.32C-88.34,180.32,-88.23,180.39,-88.2,180.42C-88.2,180.42,-88.23,180.47,-88.27,180.52C-88.3,180.58,-88.34,180.62,-88.34,180.63C-88.34,180.63,-88.3,180.66,-88.25,180.7C-88.2,180.73,-88.15,180.76,-88.15,180.76C-88.15,180.76,-88.11,180.72,-88.08,180.66C-88.04,180.6,-88,180.56,-88,180.56C-88,180.56,-87.86,180.65,-87.86,180.66C-87.86,180.66,-88.25,181.23,-88.26,181.23C-88.26,181.23,-88.29,181.21,-88.33,181.18z"/>
+      <path style="stroke:none;fill:#007BFF;fill-rule:evenodd" d="M-91.75,181.53C-91.89,181.51,-92.04,181.37,-92.08,181.22C-92.09,181.18,-92.09,181.11,-92.08,181.07C-92.05,180.96,-91.94,180.85,-91.82,180.82C-91.79,180.81,-91.7,180.81,-91.66,180.82C-91.6,180.84,-91.54,180.88,-91.48,180.93C-91.43,180.99,-91.39,181.04,-91.37,181.1C-91.36,181.13,-91.36,181.14,-91.36,181.18C-91.36,181.23,-91.36,181.26,-91.38,181.3C-91.4,181.36,-91.47,181.44,-91.53,181.48C-91.6,181.53,-91.67,181.54,-91.75,181.53zM-91.61,181.36C-91.55,181.34,-91.51,181.27,-91.53,181.21C-91.55,181.11,-91.66,181,-91.76,180.97C-91.81,180.96,-91.85,180.97,-91.88,181.01C-91.9,181.02,-91.92,181.06,-91.93,181.09C-91.94,181.14,-91.9,181.22,-91.83,181.28C-91.75,181.36,-91.67,181.39,-91.61,181.36z"/>
+      <path style="stroke:none;fill:#007BFF;fill-rule:evenodd" d="M-90.37,181.63C-90.38,181.62,-90.39,181.61,-90.42,181.55C-90.47,181.42,-90.47,181.42,-90.49,181.42C-90.5,181.42,-90.55,181.42,-90.61,181.42L-90.72,181.42L-90.72,181.43C-90.74,181.45,-90.77,181.48,-90.79,181.5C-90.86,181.53,-90.93,181.51,-90.98,181.46C-90.99,181.45,-91,181.43,-91.01,181.42C-91.02,181.4,-91.02,181.39,-91.02,181.36C-91.02,181.33,-91.02,181.32,-91.01,181.3C-90.99,181.27,-90.97,181.24,-90.93,181.22C-90.91,181.21,-90.9,181.21,-90.87,181.21C-90.81,181.21,-90.76,181.23,-90.73,181.28L-90.72,181.3L-90.58,181.3C-90.44,181.31,-90.44,181.31,-90.42,181.32C-90.4,181.32,-90.4,181.33,-90.38,181.37C-90.36,181.39,-90.33,181.46,-90.31,181.51C-90.29,181.56,-90.27,181.6,-90.26,181.61C-90.25,181.63,-90.26,181.63,-90.31,181.63C-90.34,181.63,-90.37,181.63,-90.37,181.63z"/>
+      <path style="stroke:none;fill:#007BFF;fill-rule:evenodd" d="M-87.69,181.81C-87.79,181.79,-87.87,181.72,-87.92,181.61C-87.96,181.52,-87.96,181.43,-87.92,181.35C-87.88,181.25,-87.77,181.16,-87.65,181.12C-87.64,181.12,-87.61,181.11,-87.59,181.11C-87.54,181.1,-87.5,181.1,-87.45,181.12C-87.35,181.15,-87.25,181.27,-87.22,181.39C-87.21,181.44,-87.22,181.52,-87.24,181.58C-87.28,181.66,-87.36,181.73,-87.46,181.78C-87.52,181.81,-87.55,181.82,-87.61,181.82C-87.65,181.82,-87.67,181.82,-87.69,181.81zM-87.61,181.65C-87.52,181.62,-87.42,181.54,-87.38,181.47C-87.37,181.44,-87.37,181.4,-87.38,181.36C-87.39,181.33,-87.41,181.3,-87.45,181.29C-87.47,181.28,-87.47,181.27,-87.51,181.28C-87.55,181.28,-87.59,181.29,-87.64,181.31C-87.71,181.35,-87.76,181.4,-87.78,181.45C-87.79,181.48,-87.79,181.48,-87.79,181.52C-87.79,181.55,-87.79,181.56,-87.78,181.57C-87.75,181.64,-87.69,181.67,-87.61,181.65z"/>
+      <path style="stroke:none;fill:#007BFF;fill-rule:evenodd" d="M-91.18,182.04C-91.24,182.02,-91.28,181.95,-91.28,181.89C-91.28,181.85,-91.27,181.82,-91.24,181.78C-91.2,181.75,-91.18,181.74,-91.12,181.74C-91.08,181.74,-91.07,181.74,-91.05,181.75C-91.02,181.76,-90.99,181.79,-90.97,181.82L-90.96,181.84L-90.8,181.84L-90.64,181.84L-90.64,181.88C-90.64,181.9,-90.64,181.92,-90.64,181.93L-90.64,181.95L-90.8,181.95L-90.96,181.95L-90.98,181.97C-91,182,-91.04,182.03,-91.06,182.04C-91.07,182.04,-91.09,182.04,-91.12,182.05C-91.15,182.05,-91.16,182.05,-91.18,182.04z"/>
+      <path style="stroke:none;fill:#007BFF;fill-rule:evenodd" d="M-90.43,182.1C-90.44,182.09,-90.45,182.09,-90.45,182.06L-90.45,182.04L-90.47,182.03C-90.51,182.01,-90.52,182,-90.54,181.98C-90.55,181.95,-90.56,181.9,-90.54,181.87C-90.53,181.85,-90.49,181.81,-90.47,181.81C-90.45,181.8,-90.45,181.8,-90.45,181.78C-90.44,181.75,-90.44,181.75,-90.43,181.74C-90.43,181.74,-90.4,181.74,-90.38,181.74L-90.33,181.74L-90.33,181.75C-90.32,181.75,-90.32,181.82,-90.32,181.93C-90.32,182.07,-90.32,182.09,-90.33,182.1C-90.34,182.1,-90.42,182.1,-90.43,182.1z"/>
+      <path style="stroke:none;fill:#007BFF;fill-rule:evenodd" d="M-88.59,182.13L-88.59,182L-88.7,181.81C-88.76,181.71,-88.81,181.62,-88.81,181.62C-88.81,181.62,-88.78,181.62,-88.72,181.62L-88.63,181.62L-88.57,181.73C-88.53,181.79,-88.51,181.84,-88.51,181.84C-88.5,181.84,-88.48,181.79,-88.45,181.73L-88.39,181.62L-88.3,181.62C-88.25,181.62,-88.21,181.62,-88.21,181.62C-88.21,181.62,-88.41,181.97,-88.42,181.98C-88.43,181.99,-88.43,182.02,-88.43,182.12L-88.43,182.26L-88.51,182.26L-88.59,182.26L-88.59,182.13z"/>
+      <path style="stroke:none;fill:#007BFF;fill-rule:evenodd" d="M-89.31,182.25C-89.31,182.25,-89.31,182.23,-89.31,182.2L-89.31,182.15L-89.26,182.14L-89.22,182.14L-89.22,181.94L-89.22,181.73L-89.26,181.73L-89.31,181.73L-89.31,181.67L-89.31,181.62L-89.14,181.62L-88.96,181.62L-88.96,181.67L-88.96,181.73L-89.01,181.73L-89.05,181.73L-89.05,181.94L-89.05,182.14L-89.01,182.14L-88.96,182.14L-88.96,182.2L-88.96,182.26L-89.13,182.26C-89.23,182.26,-89.31,182.25,-89.31,182.25z"/>
+      <path style="stroke:none;fill:#007BFF;fill-rule:evenodd" d="M-89.91,182.26C-89.96,182.25,-89.99,182.23,-90.05,182.19C-90.12,182.15,-90.15,182.13,-90.19,182.11L-90.22,182.1L-90.22,182.05C-90.22,182.03,-90.22,181.94,-90.22,181.87L-90.22,181.73L-90.2,181.73C-90.16,181.71,-90.11,181.69,-90.06,181.65C-90.01,181.61,-89.95,181.59,-89.92,181.58C-89.82,181.55,-89.73,181.56,-89.65,181.61C-89.56,181.65,-89.5,181.72,-89.46,181.82C-89.45,181.85,-89.45,181.86,-89.45,181.92L-89.45,181.99L-89.47,182.03C-89.49,182.08,-89.51,182.12,-89.55,182.15C-89.6,182.21,-89.66,182.25,-89.74,182.26C-89.79,182.28,-89.86,182.27,-89.91,182.26zM-89.72,181.74L-89.72,181.7L-89.8,181.7L-89.87,181.7L-89.87,181.74L-89.87,181.77L-89.8,181.77L-89.72,181.77L-89.72,181.74zM-90.03,181.89L-90.03,181.7L-90.06,181.7L-90.1,181.7L-90.1,181.89L-90.1,182.08L-90.06,182.08L-90.03,182.08L-90.03,181.89zM-89.57,181.89L-89.57,181.7L-89.6,181.7L-89.64,181.7L-89.64,181.89L-89.64,182.08L-89.6,182.08L-89.57,182.08L-89.57,181.89zM-89.87,182.15L-89.87,182.08L-89.8,182.08L-89.72,182.08L-89.72,181.96L-89.72,181.85L-89.8,181.85L-89.87,181.85L-89.87,181.89L-89.87,181.92L-89.83,181.92L-89.79,181.93L-89.79,181.96L-89.79,182L-89.87,182L-89.95,182L-89.95,182.12C-89.95,182.18,-89.95,182.23,-89.94,182.23C-89.94,182.23,-89.93,182.23,-89.91,182.23L-89.87,182.23L-89.87,182.15z"/>
+      <path style="stroke:none;fill:#007BFF;fill-rule:evenodd" d="M-92.15,182.55C-92.18,182.55,-92.22,182.54,-92.26,182.54C-92.29,182.53,-92.34,182.53,-92.37,182.53C-92.4,182.52,-92.43,182.52,-92.45,182.52C-92.47,182.51,-92.51,182.51,-92.54,182.51C-92.57,182.5,-92.62,182.5,-92.65,182.49C-92.68,182.49,-92.73,182.49,-92.76,182.48C-92.79,182.48,-92.81,182.48,-92.81,182.48C-92.81,182.47,-92.8,182.44,-92.78,182.39C-92.75,182.31,-92.75,182.31,-92.74,182.31C-92.74,182.31,-92.7,182.31,-92.67,182.32C-92.64,182.32,-92.59,182.33,-92.56,182.33C-92.53,182.34,-92.49,182.34,-92.48,182.35C-92.47,182.35,-92.44,182.35,-92.41,182.36C-92.38,182.36,-92.34,182.37,-92.32,182.37C-92.3,182.37,-92.29,182.38,-92.29,182.37C-92.29,182.37,-92.37,182.31,-92.48,182.24C-92.59,182.17,-92.67,182.11,-92.67,182.11C-92.68,182.1,-92.66,182.07,-92.65,182.02L-92.62,181.94L-92.6,181.94C-92.59,181.94,-92.56,181.95,-92.53,181.95C-92.5,181.95,-92.45,181.96,-92.43,181.96C-92.4,181.97,-92.37,181.97,-92.35,181.97C-92.33,181.98,-92.3,181.98,-92.2,181.99C-92.18,181.99,-92.16,182,-92.15,182C-92.15,182,-92.22,181.95,-92.34,181.87C-92.45,181.8,-92.54,181.75,-92.54,181.75C-92.54,181.74,-92.48,181.58,-92.48,181.58C-92.47,181.58,-91.88,181.98,-91.88,181.99C-91.88,181.99,-91.95,182.16,-91.95,182.16C-91.95,182.17,-91.99,182.16,-92.24,182.14C-92.27,182.14,-92.31,182.13,-92.33,182.13C-92.35,182.13,-92.38,182.12,-92.38,182.12C-92.39,182.12,-92.39,182.12,-92.38,182.13C-92.38,182.13,-92.3,182.18,-92.21,182.25C-92.11,182.31,-92.03,182.37,-92.03,182.37C-92.02,182.38,-92.09,182.55,-92.1,182.55C-92.1,182.55,-92.13,182.55,-92.15,182.55z"/>
+      <path style="stroke:none;fill:#007BFF;fill-rule:evenodd" d="M-87.13,182.56C-87.14,182.56,-87.17,182.55,-87.18,182.54C-87.24,182.49,-87.27,182.44,-87.3,182.34C-87.31,182.31,-87.32,182.28,-87.32,182.28C-87.32,182.28,-87.33,182.28,-87.36,182.29C-87.48,182.32,-87.53,182.33,-87.54,182.33C-87.54,182.33,-87.58,182.16,-87.58,182.16C-87.58,182.16,-87.53,182.14,-87.47,182.13C-87.4,182.11,-87.3,182.09,-87.23,182.07C-87.17,182.06,-87.07,182.03,-87.01,182.02C-86.96,182,-86.91,181.99,-86.9,181.99C-86.9,181.99,-86.89,182.02,-86.87,182.12C-86.82,182.29,-86.82,182.31,-86.82,182.36C-86.82,182.47,-86.87,182.54,-86.98,182.57C-87.02,182.58,-87.09,182.58,-87.13,182.56zM-87.03,182.39C-86.99,182.38,-86.97,182.35,-86.97,182.3C-86.97,182.28,-86.98,182.21,-86.99,182.2C-86.99,182.2,-87.02,182.2,-87.08,182.22C-87.14,182.23,-87.18,182.24,-87.18,182.25C-87.19,182.25,-87.17,182.32,-87.16,182.34C-87.15,182.36,-87.12,182.39,-87.1,182.39C-87.08,182.4,-87.06,182.4,-87.03,182.39z"/>
+      <path style="stroke:none;fill:#007BFF;fill-rule:evenodd" d="M-90.94,182.61C-90.97,182.59,-91,182.56,-91.01,182.53C-91.02,182.51,-91.02,182.5,-91.02,182.47C-91.02,182.44,-91.02,182.43,-91.01,182.41C-90.99,182.38,-90.97,182.35,-90.93,182.34C-90.91,182.33,-90.91,182.32,-90.86,182.32C-90.82,182.32,-90.82,182.32,-90.8,182.34C-90.77,182.35,-90.74,182.38,-90.72,182.4L-90.71,182.42L-90.6,182.42C-90.52,182.42,-90.48,182.42,-90.48,182.41C-90.47,182.41,-90.45,182.36,-90.43,182.3L-90.38,182.2L-90.33,182.2C-90.3,182.2,-90.28,182.2,-90.27,182.2C-90.26,182.21,-90.26,182.21,-90.27,182.22C-90.27,182.23,-90.29,182.27,-90.3,182.3C-90.32,182.34,-90.35,182.4,-90.36,182.43C-90.39,182.5,-90.41,182.52,-90.43,182.53C-90.44,182.53,-90.51,182.53,-90.58,182.53L-90.72,182.53L-90.73,182.55C-90.75,182.58,-90.77,182.6,-90.8,182.61C-90.81,182.62,-90.82,182.62,-90.86,182.62C-90.91,182.62,-90.91,182.62,-90.94,182.61z"/>
+      <path style="stroke:none;fill:#007BFF;fill-rule:evenodd" d="M-89.82,182.83C-89.83,182.83,-89.83,182.81,-89.83,182.79L-89.83,182.74L-88.33,182.74L-86.83,182.74L-86.83,182.79L-86.83,182.83L-88.32,182.83C-89.15,182.83,-89.82,182.83,-89.82,182.83z"/>
+      <path style="stroke:none;fill:#007BFF;fill-rule:evenodd" d="M-90.83,182.97L-90.83,182.93L-88.83,182.93L-86.83,182.93L-86.83,182.97L-86.83,183.01L-88.83,183.01L-90.83,183.01L-90.83,182.97z"/>
+      <path style="stroke:none;fill:#007BFF;fill-rule:evenodd" d="M-92.82,183.15L-92.82,183.1L-89.82,183.1L-86.83,183.1L-86.83,183.15L-86.83,183.19L-89.82,183.19L-92.82,183.19L-92.82,183.15z"/>
+    </symbol>
+  </svg>
+
+  <header class="hero">
+    <div class="hero-inner">
+      <div class="hero-left">
+        <svg class="hero-logo" aria-hidden="true" focusable="false"><use href="#wdiLogo"></use></svg>
+
+        <div class="hero-titles">
+          <div class="hero-title">ESP32-CAM Robot</div>
+          <div class="hero-subtitle">
+            workshop-diy.org
+            <span id="heroBuild" class="hero-badge">--</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="hero-right">
+        <button id="settingsToggle" class="hero-pill" type="button"
+                aria-controls="settingsSidebar" aria-expanded="false"
+                title="Open settings"><span class="pill-icon">⚙</span><span class="pill-text">Settings</span></button>
+
+        <button id="debugToggle" class="hero-pill" type="button"
+                aria-controls="debugSidebar" aria-expanded="false"
+                title="Open debug sidebar"><span class="pill-icon">☰</span><span class="pill-text">Debug</span></button>
+
+        <div id="linkPill" class="hero-pill hero-link" aria-live="polite">
+          <span class="pill-dot"></span><span id="linkText" class="pill-text">Connecting</span>
+        </div>
+      </div>
+    </div>
+  </header>
 
   <aside id="settingsSidebar" class="settings-sidebar" aria-label="Settings sidebar">
     <h2>Settings</h2>
 
-    <section class="settings-section">
-      <h3>Camera</h3>
+    <details class="settings-section" open>
+      <summary>Camera</summary>
 
       <div class="setting-row">
         <div class="setting-head">
@@ -1897,10 +2287,10 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       <div id="cameraStatus" class="camera-status">
         Open Settings to read camera status.
       </div>
-    </section>
+    </details>
 
-    <section class="settings-section">
-      <h3>USB Serial console</h3>
+    <details class="settings-section">
+      <summary>USB Serial console</summary>
 
       <div id="webSerialSupport" class="serial-web-status">
         Checking browser serial support...
@@ -1977,45 +2367,11 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
         require a secure page (HTTPS or localhost), so it may be unavailable
         when this robot page is opened directly from a LAN IP address.
       </div>
-    </section>
-  </aside>
+    </details>
 
-  <button id="debugToggle" class="debug-toggle" type="button"
-          aria-controls="debugSidebar" aria-expanded="false"
-          title="Open debug sidebar">☰</button>
+    <details class="settings-section">
+      <summary>Firmware update (OTA)</summary>
 
-  <aside id="debugSidebar" class="debug-sidebar" aria-label="Debug sidebar">
-    <h2>Robot Debug</h2>
-
-    <div class="debug-grid">
-      <span class="label">Motion</span><span id="dbgMotion" class="value">--</span>
-      <span class="label">Left target</span><span id="dbgLeftTarget" class="value">--</span>
-      <span class="label">Right target</span><span id="dbgRightTarget" class="value">--</span>
-      <span class="label">Left output</span><span id="dbgLeftOutput" class="value">--</span>
-      <span class="label">Right output</span><span id="dbgRightOutput" class="value">--</span>
-      <span class="label">Flash LED</span><span id="dbgLed" class="value">--</span>
-      <span class="label">Network mode</span><span id="dbgNetworkMode" class="value">--</span>
-      <span class="label">STA status</span><span id="dbgStaStatus" class="value">--</span>
-      <span class="label">Network SSID</span><span id="dbgNetworkSsid" class="value">--</span>
-      <span class="label">Robot IP</span><span id="dbgRobotIp" class="value">--</span>
-      <span class="label">AP clients</span><span id="dbgApClients" class="value">--</span>
-      <span class="label">Wi-Fi RSSI</span><span id="dbgRssi" class="value">--</span>
-      <span class="label">Uptime</span><span id="dbgUptime" class="value">--</span>
-      <span class="label">Stream</span><span id="dbgStream" class="value">--</span>
-    </div>
-
-    <div class="debug-status-row">
-      <span id="dbgConnection" class="debug-connection">Paused</span>
-
-      <div class="debug-log-actions">
-        <button id="exportDebugLog" class="debug-clear" type="button">Export log</button>
-        <button id="clearDebugLog" class="debug-clear" type="button">Clear log</button>
-      </div>
-    </div>
-
-    <div id="dbgMessage" class="debug-message">Open the sidebar to start live debugging.</div>
-
-    <div class="debug-log-title">Firmware update (OTA)</div>
     <div class="ota-panel">
       <div class="ota-build">
         <span>Build</span>
@@ -2051,6 +2407,41 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
         Motors stop before update. Do not remove power while firmware is uploading.
       </div>
     </div>
+    </details>
+  </aside>
+
+  <aside id="debugSidebar" class="debug-sidebar" aria-label="Debug sidebar">
+    <h2>Robot Debug</h2>
+
+    <div class="debug-grid">
+      <span class="label">Motion</span><span id="dbgMotion" class="value">--</span>
+      <span class="label">Left target</span><span id="dbgLeftTarget" class="value">--</span>
+      <span class="label">Right target</span><span id="dbgRightTarget" class="value">--</span>
+      <span class="label">Left output</span><span id="dbgLeftOutput" class="value">--</span>
+      <span class="label">Right output</span><span id="dbgRightOutput" class="value">--</span>
+      <span class="label">Flash LED</span><span id="dbgLed" class="value">--</span>
+      <span class="label">Network mode</span><span id="dbgNetworkMode" class="value">--</span>
+      <span class="label">STA status</span><span id="dbgStaStatus" class="value">--</span>
+      <span class="label">Network SSID</span><span id="dbgNetworkSsid" class="value">--</span>
+      <span class="label">Robot IP</span><span id="dbgRobotIp" class="value">--</span>
+      <span class="label">AP clients</span><span id="dbgApClients" class="value">--</span>
+      <span class="label">Wi-Fi RSSI</span><span id="dbgRssi" class="value">--</span>
+      <span class="label">Uptime</span><span id="dbgUptime" class="value">--</span>
+      <span class="label">Stream</span><span id="dbgStream" class="value">--</span>
+    </div>
+
+    <div class="debug-status-row">
+      <span id="dbgConnection" class="debug-connection">Paused</span>
+
+      <div class="debug-log-actions">
+        <button id="exportDebugLog" class="debug-clear" type="button">Export log</button>
+        <button id="clearDebugLog" class="debug-clear" type="button">Clear log</button>
+      </div>
+    </div>
+
+    <div id="dbgActionStatus" class="debug-small"></div>
+
+    <div id="dbgMessage" class="debug-message">Open the sidebar to start live debugging.</div>
 
     <div class="debug-log-title">Event log</div>
     <div id="dbgLog" class="debug-log" aria-live="polite"></div>
@@ -2064,11 +2455,23 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
   </aside>
 
   <div class="robot">
-    <h1>ESP32-CAM Robot</h1>
-
     <div id="videoFrame" class="video-frame">
       <img src="" id="photo" alt="ESP32-CAM video stream">
+
       <div id="streamStatus" class="stream-status" aria-live="polite"></div>
+
+      <div class="video-footer">
+        <div class="video-overlay video-brand">
+<svg class="brand-logo" aria-hidden="true" focusable="false"><use href="#wdiLogo"></use></svg>
+          <span>workshop-diy.org</span>
+        </div>
+
+        <div class="video-overlay video-telemetry">
+          <span id="videoFps">-- fps</span>
+          <span id="videoRssi">-- dBm</span>
+          <span id="videoMotion">STOP</span>
+        </div>
+      </div>
     </div>
 
     <div class="panel">
@@ -2238,6 +2641,33 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     const clearDebugLog = document.getElementById("clearDebugLog");
     const exportDebugLog = document.getElementById("exportDebugLog");
     const dbgBuild = document.getElementById("dbgBuild");
+    const dbgActionStatus = document.getElementById("dbgActionStatus");
+    const heroBuild = document.getElementById("heroBuild");
+    const linkPill = document.getElementById("linkPill");
+    const linkText = document.getElementById("linkText");
+
+    // Only the icon changes when a sidebar opens; the label stays put.
+    const settingsIcon = settingsToggle.querySelector(".pill-icon");
+    const debugIcon = debugToggle.querySelector(".pill-icon");
+
+    // What the header pill says about the robot as a whole.
+    const LINK_STATES = {
+      connecting: "Connecting",
+      live: "Live",
+      novideo: "No video",
+      offline: "Offline"
+    };
+
+    function setLinkState(state) {
+      if (!LINK_STATES[state]) return;
+
+      linkText.textContent = LINK_STATES[state];
+      linkPill.classList.remove(
+        "is-live", "is-novideo", "is-offline"
+      );
+
+      if (state !== "connecting") linkPill.classList.add("is-" + state);
+    }
     const otaPassword = document.getElementById("otaPassword");
     const otaFile = document.getElementById("otaFile");
     const otaUploadButton = document.getElementById("otaUploadButton");
@@ -2356,6 +2786,98 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     // reloaded by hand.
 
     const streamStatus = document.getElementById("streamStatus");
+    const videoTelemetry = document.querySelector(".video-telemetry");
+    const videoFps = document.getElementById("videoFps");
+    const videoRssi = document.getElementById("videoRssi");
+    const videoMotion = document.getElementById("videoMotion");
+
+    // Below this the link is on its way out. The video usually survives a
+    // while longer than the commands do, so this is the earliest honest
+    // warning the picture can give a driver.
+    const RSSI_WEAK_DBM = -75;
+    const MOTION_TIMEOUT_FLASH_MS = 3000;
+
+    let lastMotionTimeouts = null;
+    let motionTimeoutFlashUntil = 0;
+
+    // The readouts are dim until one of them matters.
+    function refreshTelemetryEmphasis() {
+      const awake =
+        videoMotion.classList.contains("is-moving") ||
+        videoRssi.classList.contains("is-weak") ||
+        Date.now() < motionTimeoutFlashUntil;
+
+      videoTelemetry.classList.toggle("is-awake", awake);
+    }
+
+    // Frame rate is measured on the robot, not here: a browser reports a
+    // multipart image as loaded once, so the page cannot count frames.
+    function setVideoFps(fps10) {
+      videoFps.textContent = (fps10 === null || fps10 === undefined)
+        ? "-- fps"
+        : ((fps10 / 10).toFixed(1) + " fps");
+    }
+
+    function setVideoRssi(rssi, valid) {
+      if (!valid) {
+        videoRssi.textContent = "-- dBm";
+        videoRssi.classList.remove("is-weak");
+      } else {
+        videoRssi.textContent = rssi + " dBm";
+        videoRssi.classList.toggle("is-weak", rssi <= RSSI_WEAK_DBM);
+      }
+
+      refreshTelemetryEmphasis();
+    }
+
+    function setVideoMotion(text, moving) {
+      // A timeout flash owns the field until it expires; it is the more
+      // important thing to be reading.
+      if (Date.now() < motionTimeoutFlashUntil) return;
+
+      videoMotion.textContent = text;
+      videoMotion.classList.toggle("is-moving", Boolean(moving));
+      refreshTelemetryEmphasis();
+    }
+
+    // Called on press and release, so the field answers immediately rather
+    // than at the next poll. The robot's own view arrives below and overrides
+    // it -- which is the point: if a command was lost, this corrects itself.
+    function showLocalMotion(action) {
+      setVideoMotion(action ? action.toUpperCase() : "STOP", Boolean(action));
+    }
+
+    function applyTelemetry(data) {
+      setVideoFps(data.streamActive ? data.streamFps10 : null);
+      setVideoRssi(Number(data.rssi), Boolean(data.rssiValid));
+
+      const timeouts = Number(data.motionTimeouts) || 0;
+
+      if (lastMotionTimeouts !== null && timeouts > lastMotionTimeouts) {
+        // The dead man's switch fired. Without this the robot just stops and
+        // the reason is buried in an event log nobody is reading mid-drive.
+        motionTimeoutFlashUntil = Date.now() + MOTION_TIMEOUT_FLASH_MS;
+
+        videoMotion.textContent = "TIMEOUT";
+        videoMotion.classList.remove("is-moving");
+        videoMotion.classList.add("is-timeout");
+
+        setTimeout(() => {
+          videoMotion.classList.remove("is-timeout");
+          refreshTelemetryEmphasis();
+        }, MOTION_TIMEOUT_FLASH_MS);
+      }
+
+      lastMotionTimeouts = timeouts;
+
+      const moving = data.motion && data.motion !== "STOPPED";
+      setVideoMotion(
+        moving ? (data.motion + " " + data.left + "/" + data.right) : "STOP",
+        moving
+      );
+
+      refreshTelemetryEmphasis();
+    }
 
     // 1x1 transparent GIF. Assigning it aborts the MJPEG connection cleanly;
     // an empty src would fire an error and re-request the page instead.
@@ -2395,6 +2917,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       streamStopped = false;
       streamStartedAtMs = Date.now();
 
+      setVideoFps(null);
       setStreamStatus("Connecting to the camera...");
       photo.src = streamUrl();
     }
@@ -2404,6 +2927,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       streamRetryTimer = null;
 
       streamStopped = true;
+      setVideoFps(null);
       photo.src = BLANK_IMAGE;
     }
 
@@ -2445,10 +2969,9 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     // picture simply stops. The robot knows whether it is still sending, and
     // the control server answers even while the stream server is busy.
     async function checkStreamHealth() {
-      if (streamStopped || document.hidden) return;
-      if (Date.now() - streamStartedAtMs < STREAM_GRACE_MS) return;
+      if (document.hidden) return;
 
-      let live = false;
+      let data = null;
 
       try {
         const response = await fetch("/camera?stream=1", {
@@ -2457,15 +2980,24 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
 
         if (!response.ok) return;
 
-        const data = await response.json();
-        live = Boolean(data.streamActive) && data.streamFps10 > 0;
+        data = await response.json();
       } catch (error) {
-        // The robot is unreachable altogether; reconnecting the video will
-        // not help, and the error handler covers it when it comes back.
+        // Not just the video: the robot is not answering at all.
+        setLinkState("offline");
         return;
       }
 
-      if (!live && !streamStopped) {
+      const live = Boolean(data.streamActive) && data.streamFps10 > 0;
+
+      // The readouts and the header pill are reported whatever the stream is
+      // doing; only the decision to restart it is held back below.
+      applyTelemetry(data);
+      setLinkState(live ? "live" : "novideo");
+
+      if (streamStopped) return;
+      if (Date.now() - streamStartedAtMs < STREAM_GRACE_MS) return;
+
+      if (!live) {
         scheduleStreamRestart("Camera stream stopped. Reconnecting...");
       }
     }
@@ -2507,6 +3039,10 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     window.addEventListener("load", () => {
       restoreImageRotation();
       startStream();
+
+      // One small request for the build stamp in the header badge, once, and
+      // late enough not to compete with the stream opening.
+      setTimeout(ensureBuildInfo, 2000);
 
       sendMotorSpeed("left", leftSpeedSlider.value);
       sendMotorSpeed("right", rightSpeedSlider.value);
@@ -2689,6 +3225,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     clearDebugLog.addEventListener("click", () => {
       dbgLog.textContent = "";
       debugLogCount = 0;
+      dbgActionStatus.textContent = "Event log view cleared.";
       // lastEventId is intentionally kept. Clearing the view should not make
       // old buffered ESP32 events reappear on the next refresh.
     });
@@ -2767,8 +3304,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
 
       setTimeout(() => URL.revokeObjectURL(url), 1000);
 
-      otaProgressText.textContent =
-        "Debug log exported as a text file.";
+      dbgActionStatus.textContent = "Debug log exported as a text file.";
     });
 
     function stopDebugPolling() {
@@ -2782,6 +3318,11 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     }
 
     function startDebugPolling() {
+      // Polling exists to feed this sidebar. The OTA flow restarts it when an
+      // upload finishes, and OTA now lives in the settings sidebar -- which
+      // means the debug sidebar is closed at that moment. Without this guard
+      // the poll would run on against a panel nobody is looking at.
+      if (!debugSidebar.classList.contains("open")) return;
       if (debugTimer !== null) return;
 
       refreshDebug();
@@ -3108,14 +3649,14 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     function closeSettingsSidebar() {
       settingsSidebar.classList.remove("open");
       settingsToggle.setAttribute("aria-expanded", "false");
-      settingsToggle.textContent = "⚙";
+      settingsIcon.textContent = "⚙";
       settingsToggle.title = "Open settings";
     }
 
     function closeDebugSidebar() {
       debugSidebar.classList.remove("open");
       debugToggle.setAttribute("aria-expanded", "false");
-      debugToggle.textContent = "☰";
+      debugIcon.textContent = "☰";
       debugToggle.title = "Open debug sidebar";
       stopDebugPolling();
     }
@@ -3193,15 +3734,48 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       }, 120);
     }
 
+    // Highest possible event id: asks /status for the status fields alone,
+    // with no event backlog attached to the reply.
+    const STATUS_WITHOUT_EVENTS = "4294967295";
+
+    let buildFetched = false;
+
+    // dbgBuild sits in the OTA card, which is in this sidebar, but it is
+    // filled by the debug poll -- which only runs while the other sidebar is
+    // open. Fetch it once, on demand: a build stamp cannot change without a
+    // reboot, and a dash on the one field that confirms a flash worked is
+    // worse than an extra request.
+    async function ensureBuildInfo() {
+      if (buildFetched) return;
+
+      try {
+        const response = await fetch(
+          "/status?after=" + STATUS_WITHOUT_EVENTS,
+          { cache: "no-store" }
+        );
+
+        if (!response.ok) return;
+
+        const data = await response.json();
+        if (!data.build) return;
+
+        dbgBuild.textContent = data.build;
+        heroBuild.textContent = data.build;
+        buildFetched = true;
+      } catch (error) {
+      }
+    }
+
     settingsToggle.addEventListener("click", () => {
       const isOpen = settingsSidebar.classList.toggle("open");
       settingsToggle.setAttribute("aria-expanded", isOpen ? "true" : "false");
-      settingsToggle.textContent = isOpen ? "×" : "⚙";
+      settingsIcon.textContent = isOpen ? "×" : "⚙";
       settingsToggle.title = isOpen ? "Close settings" : "Open settings";
 
       if (isOpen) {
         closeDebugSidebar();
         refreshCameraSettings();
+        ensureBuildInfo();
       }
     });
 
@@ -3267,7 +3841,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     debugToggle.addEventListener("click", () => {
       const isOpen = debugSidebar.classList.toggle("open");
       debugToggle.setAttribute("aria-expanded", isOpen ? "true" : "false");
-      debugToggle.textContent = isOpen ? "×" : "☰";
+      debugIcon.textContent = isOpen ? "×" : "☰";
       debugToggle.title = isOpen ? "Close debug sidebar" : "Open debug sidebar";
 
       if (isOpen) {
@@ -3303,10 +3877,21 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
         dbgRssi.textContent =
           data.rssiValid ? (data.rssi + " dBm") : "N/A";
         dbgUptime.textContent = formatUptime(data.uptimeMs);
-        dbgStream.textContent = data.streamActive
-          ? ((data.streamFps10 / 10).toFixed(1) + " fps")
-          : "no viewer";
-        dbgBuild.textContent = data.build || "--";
+        if (!streamStopped) {
+          setVideoFps(data.streamActive ? data.streamFps10 : null);
+        }
+
+        const streamDrops = Number(data.streamDrops) || 0;
+        dbgStream.textContent =
+          (data.streamActive
+            ? ((data.streamFps10 / 10).toFixed(1) + " fps")
+            : "no viewer") +
+          (streamDrops ? (" (" + streamDrops + " ended)") : "");
+        if (data.build) {
+          dbgBuild.textContent = data.build;
+          heroBuild.textContent = data.build;
+          buildFetched = true;
+        }
 
         const message = data.message || "(no message)";
         dbgMessage.textContent = message;
@@ -3458,6 +4043,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     }
 
     function sendStopTwice() {
+      showLocalMotion(null);
       sendAction("stop");
 
       clearTimeout(driveStopRepeatTimer);
@@ -3471,6 +4057,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       clearDriveKeepalive();
 
       activeDriveAction = action;
+      showLocalMotion(action);
       sendAction(action);
 
       driveKeepaliveTimer = setInterval(() => {
@@ -3669,7 +4256,12 @@ static esp_err_t stream_handler(httpd_req_t *req) {
 
   streamClientActive = true;
   streamFps10 = 0;
-  setDebugMessage("CAMERA: Stream client connected");
+
+  // Opening a stream is not worth an event of its own; a stream that ends is,
+  // and it is logged once below with how long it lasted. A viewer that keeps
+  // reconnecting would otherwise fill the 64-event history with pairs of
+  // lines and push out whatever caused the drops.
+  unsigned long streamStartedMs = millis();
 
   res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
 
@@ -3737,7 +4329,17 @@ static esp_err_t stream_handler(httpd_req_t *req) {
 
   streamClientActive = false;
   streamFps10 = 0;
-  setDebugMessage("CAMERA: Stream client disconnected");
+  streamDropCount++;
+
+  char endDbg[96];
+  snprintf(
+    endDbg,
+    sizeof(endDbg),
+    "CAMERA: Stream ended after %lus (%lu since boot)",
+    (unsigned long)((millis() - streamStartedMs + 500) / 1000),
+    (unsigned long)streamDropCount
+  );
+  setDebugMessage(endDbg);
 
   return res;
 }
@@ -3789,8 +4391,10 @@ static esp_err_t status_handler(httpd_req_t *req) {
   const char *mode = networkModeName();
 
   bool staConnected = (WiFi.status() == WL_CONNECTED);
-  bool rssiValid = staConnected;
-  long rssi = staConnected ? (long)WiFi.RSSI() : 0;
+  long rssi = 0;
+  // Same source as the video overlay, so the panel and the picture cannot
+  // disagree -- and so the reading is not "N/A" for everyone on the AP.
+  bool rssiValid = currentLinkRssi(&rssi);
   unsigned int apClients = fallbackApActive ? WiFi.softAPgetStationNum() : 0;
 
   if (staConnected) {
@@ -3854,6 +4458,7 @@ static esp_err_t status_handler(httpd_req_t *req) {
     "\"uptimeMs\":%lu,"
     "\"streamActive\":%s,"
     "\"streamFps10\":%lu,"
+    "\"streamDrops\":%lu,"
     "\"build\":\"%s %s\","
     "\"message\":\"%s\","
     "\"latestEventId\":%lu,"
@@ -3875,6 +4480,7 @@ static esp_err_t status_handler(httpd_req_t *req) {
     (unsigned long)millis(),
     streamClientActive ? "true" : "false",
     (unsigned long)streamFps10,
+    (unsigned long)streamDropCount,
     __DATE__,
     __TIME__,
     messageCopy,
@@ -4036,14 +4642,26 @@ static esp_err_t camera_handler(httpd_req_t *req) {
         value,
         sizeof(value)
       ) == ESP_OK) {
-    char body[64];
+    long rssi = 0;
+    bool rssiValid = currentLinkRssi(&rssi);
+
+    char body[224];
 
     snprintf(
       body,
       sizeof(body),
-      "{\"streamActive\":%s,\"streamFps10\":%lu}",
+      "{\"streamActive\":%s,\"streamFps10\":%lu,"
+      "\"rssi\":%ld,\"rssiValid\":%s,"
+      "\"motion\":\"%s\",\"left\":%d,\"right\":%d,"
+      "\"motionTimeouts\":%lu}",
       streamClientActive ? "true" : "false",
-      (unsigned long)streamFps10
+      (unsigned long)streamFps10,
+      rssi,
+      rssiValid ? "true" : "false",
+      motionName(motionState),
+      currentLeftPWM,
+      currentRightPWM,
+      (unsigned long)motionTimeoutCount
     );
 
     httpd_resp_set_type(req, "application/json");

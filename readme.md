@@ -59,6 +59,59 @@ For true bidirectional control, use an H-bridge such as a DRV8833 or TB6612FNG.
 
 The ESP32-CAM serves an MJPEG stream on port **81**.
 
+### Overlays on the video
+
+**Bottom left** -- the workshop-diy.org mark, held at 30% opacity. A
+watermark, not a readout. On a narrow frame the wordmark drops and the logo
+stays.
+
+**Bottom right** -- three readouts: frame rate, signal strength, and what the
+robot thinks its motors are doing. Also 30% **at rest**, but they come up to
+full the moment one of them matters:
+
+- the robot is moving (`RIGHT 220/0`, blue)
+- the signal is at or below -75 dBm (amber) -- the earliest honest warning
+  that you are driving out of range, since the video outlasts the commands
+- the dead man's switch has just fired (`TIMEOUT`, red, three seconds)
+
+That last one is the point of the whole row: the motion timeout used to stop
+the robot and explain itself only in an event log nobody reads mid-drive.
+
+The frame rate is measured on the robot, because a browser reports a multipart
+image as loaded once, on the first frame, and cannot count them. Signal is the
+station RSSI in normal Wi-Fi, and on the fallback AP it is how well the robot
+hears *your* device -- the number that actually matters there. Motion is drawn
+the instant you press or release a button and then corrected by the robot's
+own view, which is exactly how a lost command becomes visible.
+
+All of it rides the stream health check that already runs every three seconds.
+No extra requests.
+
+**Top left** -- the stream status, when there is something to say. It is never
+dimmed; it is the one overlay that is asking you to do something.
+
+These are page elements beside the image, not pixels in it. So they stay
+upright at every display rotation, because rotation transforms the image
+alone, and anything that saves or records the stream directly gets clean
+frames. Burning a watermark into the video would mean decoding, drawing and
+re-encoding every frame on the ESP32, which would cost far more frame rate
+than the mark is worth.
+
+### Header
+
+A sticky bar across the top: the logo, the robot name, and `workshop-diy.org`
+with the running firmware's build stamp beside it. On the right, three pills --
+**Settings**, **Debug**, and a link indicator that reads `Live` (green),
+`No video` (amber) or `Offline` (red, pulsing) from the same health check.
+
+The sidebar toggles used to float in the top corners, on top of the video. The
+header sits above the sidebars deliberately, so the pill that opened one is
+still there to close it. On narrow screens the two toggle labels drop to
+icons; the link pill keeps its text.
+
+The logo is defined once as an SVG `symbol` and referenced by both the header
+and the watermark. Two inline copies would cost 3.5 KB twice.
+
 ### Video stream behavior
 
 - Defaults are **VGA at JPEG quality 12** with two frame buffers when PSRAM is
@@ -77,7 +130,12 @@ The ESP32-CAM serves an MJPEG stream on port **81**.
 - The stream **pauses while its browser tab is hidden**, so a forgotten tab
   does not hold the single viewer slot or spend radio time on frames nobody is
   watching. It resumes when the tab comes back.
-- The debug sidebar shows the frame rate the robot is actually sending.
+- The debug sidebar shows the frame rate the robot is actually sending, and
+  how many streams have ended since boot. A viewer coming and going is normal;
+  a count that climbs on its own is a link that keeps dropping.
+- Opening a stream is not logged. A stream that ends is, once, with how long
+  it lasted -- a browser that keeps reconnecting would otherwise fill the
+  64-event history with pairs of lines and push out whatever caused it.
 
 The Settings sidebar provides:
 
@@ -118,10 +176,13 @@ The robot page has two collapsible sidebars.
 
 ### Left sidebar: Settings
 
-Includes:
+Three collapsible sections. Camera is open on arrival; the other two stay shut
+until you want them.
 
-- Camera controls
-- USB Serial console controls
+**Camera** -- the camera controls listed above.
+
+**USB Serial console**
+
 - Serial baud selector
 - Select port / Connect / Disconnect
 - Live UART capture terminal
@@ -129,6 +190,18 @@ Includes:
 - Clear capture
 - Save capture
 - Command entry
+
+**Firmware update (OTA)**
+
+- Firmware build date/time of the running firmware
+- OTA password
+- Firmware .bin picker
+- Upload, with a progress bar
+
+The split is by what you are doing: Settings is what you change on the robot,
+Debug is what you watch while driving it. The build stamp sits in the OTA card
+because it is what tells you an upload actually took -- upload, wait for the
+reboot, check the date changed.
 
 ### Right sidebar: Robot Debug
 
@@ -145,12 +218,10 @@ Shows:
 - Wi-Fi RSSI
 - Uptime
 - Stream frame rate, or "no viewer"
-- Firmware build date/time
 - Latest debug message
 - 64-event retained event history
 - Export debug log
 - Clear debug log
-- Browser OTA firmware update
 
 Newest debug events are shown at the top.
 
@@ -248,6 +319,29 @@ At boot the robot:
 `XXXX` is generated from part of the ESP32 chip ID so several classroom robots can have different SSIDs.
 
 If normal Wi-Fi works, the robot is usually reached at the DHCP address shown in the debug sidebar or UART console.
+
+### Retries while the fallback AP is in use
+
+The access point and the station share one radio and one channel, and the
+station is the one that picks it. Retrying the configured Wi-Fi therefore
+means a scan and an association that stalls AP traffic for a second or two,
+and can throw AP clients off outright -- it used to cut the video and swallow
+motor commands every 30 seconds while someone was driving.
+
+So while **any client is connected to the fallback AP, the retries stop**, and
+the log says so once:
+
+`NET: Wi-Fi retry paused while the fallback AP is in use`
+
+They resume when the last client disconnects. The consequence is worth knowing:
+if you stay connected to the fallback AP, the robot will not rejoin the
+configured network on its own. Disconnect for a minute, or reboot it, once the
+normal network is back.
+
+With nobody connected, retries **back off** from 30 seconds, doubling to a
+five-minute cap, and reset once the configured network is joined. Each attempt
+logs the interval for the next one.
+
 
 ## Debug event system
 

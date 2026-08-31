@@ -146,6 +146,36 @@
 
 <p>The ESP32-CAM serves an MJPEG stream on port <strong>81</strong>.</p>
 
+<h3>Overlays on the video</h3>
+
+<p><strong>Bottom left</strong> -- the workshop-diy.org mark, held at 30% opacity. A watermark, not a readout. On a narrow frame the wordmark drops and the logo stays.</p>
+
+<p><strong>Bottom right</strong> -- three readouts: frame rate, signal strength, and what the robot thinks its motors are doing. Also 30% <strong>at rest</strong>, but they come up to full the moment one of them matters:</p>
+
+<ul>
+<li>the robot is moving (<code>RIGHT 220/0</code>, blue)</li>
+<li>the signal is at or below -75 dBm (amber) -- the earliest honest warning that you are driving out of range, since the video outlasts the commands</li>
+<li>the dead man's switch has just fired (<code>TIMEOUT</code>, red, three seconds)</li>
+</ul>
+
+<p>That last one is the point of the whole row: the motion timeout used to stop the robot and explain itself only in an event log nobody reads mid-drive.</p>
+
+<p>The frame rate is measured on the robot, because a browser reports a multipart image as loaded once, on the first frame, and cannot count them. Signal is the station RSSI in normal Wi-Fi, and on the fallback AP it is how well the robot hears <em>your</em> device -- the number that actually matters there. Motion is drawn the instant you press or release a button and then corrected by the robot's own view, which is exactly how a lost command becomes visible.</p>
+
+<p>All of it rides the stream health check that already runs every three seconds. No extra requests.</p>
+
+<p><strong>Top left</strong> -- the stream status, when there is something to say. It is never dimmed; it is the one overlay that is asking you to do something.</p>
+
+<p>These are page elements beside the image, not pixels in it. So they stay upright at every display rotation, because rotation transforms the image alone, and anything that saves or records the stream directly gets clean frames. Burning a watermark into the video would mean decoding, drawing and re-encoding every frame on the ESP32, which would cost far more frame rate than the mark is worth.</p>
+
+<h3>Header</h3>
+
+<p>A sticky bar across the top: the logo, the robot name, and <code>workshop-diy.org</code> with the running firmware's build stamp beside it. On the right, three pills -- <strong>Settings</strong>, <strong>Debug</strong>, and a link indicator that reads <code>Live</code> (green), <code>No video</code> (amber) or <code>Offline</code> (red, pulsing) from the same health check.</p>
+
+<p>The sidebar toggles used to float in the top corners, on top of the video. The header sits above the sidebars deliberately, so the pill that opened one is still there to close it. On narrow screens the two toggle labels drop to icons; the link pill keeps its text.</p>
+
+<p>The logo is defined once as an SVG <code>symbol</code> and referenced by both the header and the watermark. Two inline copies would cost 3.5 KB twice.</p>
+
 <h3>Video stream behavior</h3>
 
 <ul>
@@ -155,7 +185,8 @@
 <li><strong>One viewer at a time.</strong> A second browser is told the stream is in use rather than being left with a picture that never arrives.</li>
 <li>The page <strong>reconnects on its own</strong>. If the stream drops or simply stops -- a failed capture and a reboot both end it without any error the browser can see -- the page notices within a few seconds and re-opens it. A short message in the corner of the video says what is happening.</li>
 <li>The stream <strong>pauses while its browser tab is hidden</strong>, so a forgotten tab does not hold the single viewer slot or spend radio time on frames nobody is watching. It resumes when the tab comes back.</li>
-<li>The debug sidebar shows the frame rate the robot is actually sending.</li>
+<li>The debug sidebar shows the frame rate the robot is actually sending, and how many streams have ended since boot. A viewer coming and going is normal; a count that climbs on its own is a link that keeps dropping.</li>
+<li>Opening a stream is not logged. A stream that ends is, once, with how long it lasted -- a browser that keeps reconnecting would otherwise fill the 64-event history with pairs of lines and push out whatever caused it.</li>
 </ul>
 
 <p>The Settings sidebar provides:</p>
@@ -206,16 +237,14 @@
 <p>Includes:</p>
 
 <ul>
-<li>Camera controls</li>
-<li>USB Serial console controls</li>
-<li>Serial baud selector</li>
-<li>Select port / Connect / Disconnect</li>
-<li>Live UART capture terminal</li>
-<li>Auto-scroll</li>
-<li>Clear capture</li>
-<li>Save capture</li>
-<li>Command entry</li>
+<li><strong>Camera</strong> -- the camera controls listed above</li>
+<li><strong>USB Serial console</strong> -- baud selector, select port / connect / disconnect, live UART capture terminal, auto-scroll, clear capture, save capture, command entry</li>
+<li><strong>Firmware update (OTA)</strong> -- build date/time of the running firmware, OTA password, .bin picker, upload with a progress bar</li>
 </ul>
+
+<p>Three collapsible sections. Camera is open on arrival; the other two stay shut until you want them.</p>
+
+<p>The split is by what you are doing: Settings is what you change on the robot, Debug is what you watch while driving it. The build stamp sits in the OTA card because it is what tells you an upload actually took -- upload, wait for the reboot, check the date changed.</p>
 
 <h3>Right sidebar: Robot Debug</h3>
 
@@ -233,12 +262,10 @@
 <li>Wi-Fi RSSI</li>
 <li>Uptime</li>
 <li>Stream frame rate, or "no viewer"</li>
-<li>Firmware build date/time</li>
 <li>Latest debug message</li>
 <li>64-event retained event history</li>
 <li>Export debug log</li>
 <li>Clear debug log</li>
-<li>Browser OTA firmware update</li>
 </ul>
 
 <p>Newest debug events are shown at the top.</p>
@@ -338,6 +365,18 @@ python -m http.server 8000
 <p><code>XXXX</code> is generated from part of the ESP32 chip ID so several classroom robots can have different SSIDs.</p>
 
 <p>If normal Wi-Fi works, the robot is usually reached at the DHCP address shown in the debug sidebar or UART console.</p>
+
+<h3>Retries while the fallback AP is in use</h3>
+
+<p>The access point and the station share one radio and one channel, and the station is the one that picks it. Retrying the configured Wi-Fi therefore means a scan and an association that stalls AP traffic for a second or two, and can throw AP clients off outright -- it used to cut the video and swallow motor commands every 30 seconds while someone was driving.</p>
+
+<p>So while <strong>any client is connected to the fallback AP, the retries stop</strong>, and the log says so once:</p>
+
+<p><code>NET: Wi-Fi retry paused while the fallback AP is in use</code></p>
+
+<p>They resume when the last client disconnects. The consequence is worth knowing: if you stay connected to the fallback AP, the robot will not rejoin the configured network on its own. Disconnect for a minute, or reboot it, once the normal network is back.</p>
+
+<p>With nobody connected, retries <strong>back off</strong> from 30 seconds, doubling to a five-minute cap, and reset once the configured network is joined. Each attempt logs the interval for the next one.</p>
 
 <h2>Debug event system</h2>
 
