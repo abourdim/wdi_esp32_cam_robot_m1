@@ -108,6 +108,23 @@
 <li>Reverse is intentionally disabled because the present PCB uses one low-side MOSFET per motor rather than an H-bridge.</li>
 </ul>
 
+<h3>Hold to drive, and the motion timeout</h3>
+
+<p>The direction buttons drive only while they are held. Because every command is a plain fire-and-forget request, any single one of them can be lost -- and the one that matters is the <strong>stop</strong>. A dropped stop used to leave a wheel turning until some later command happened to get through.</p>
+
+<p>So the robot no longer relies on hearing the stop:</p>
+
+<ul>
+<li>A held button <strong>repeats its command every 250 ms</strong>.</li>
+<li>If the robot hears no motion command for <strong>600 ms</strong>, it stops the motors itself and logs <code>SAFETY: motion timeout; motors stopped</code>.</li>
+<li>The release sends stop <strong>twice</strong>, 150 ms apart.</li>
+<li>Losing window focus, hiding the tab, or leaving the page also stops.</li>
+</ul>
+
+<p>A lost packet, a closed laptop, a browser that never reported the release, or a robot that drives out of Wi-Fi range now all end the same way: the motors stop within about half a second.</p>
+
+<p>Keepalive repeats are not written to the event log -- several entries a second would bury everything else -- so a held button still shows as one command.</p>
+
 <p>At very low PWM values a motor may buzz without turning. This is useful for experiments because students can identify each motor&#x27;s real starting threshold. Do not leave a stalled motor powered for long periods.</p>
 
 <h2>Motor power hardware</h2>
@@ -128,6 +145,18 @@
 <h2>Camera</h2>
 
 <p>The ESP32-CAM serves an MJPEG stream on port <strong>81</strong>.</p>
+
+<h3>Video stream behavior</h3>
+
+<ul>
+<li>Defaults are <strong>VGA at JPEG quality 12</strong> with two frame buffers when PSRAM is present, and <strong>QVGA</strong> when it is not. Quality 12 rather than 10 because the Wi-Fi link, not the sensor, sets the frame rate.</li>
+<li>The camera always hands over its <strong>newest</strong> frame. Queued frames would arrive a capture late, which looks like lag even when the frame rate is fine.</li>
+<li>Wi-Fi modem sleep is switched off. Left on, the radio parks between beacons and the picture stutters.</li>
+<li><strong>One viewer at a time.</strong> A second browser is told the stream is in use rather than being left with a picture that never arrives.</li>
+<li>The page <strong>reconnects on its own</strong>. If the stream drops or simply stops -- a failed capture and a reboot both end it without any error the browser can see -- the page notices within a few seconds and re-opens it. A short message in the corner of the video says what is happening.</li>
+<li>The stream <strong>pauses while its browser tab is hidden</strong>, so a forgotten tab does not hold the single viewer slot or spend radio time on frames nobody is watching. It resumes when the tab comes back.</li>
+<li>The debug sidebar shows the frame rate the robot is actually sending.</li>
+</ul>
 
 <p>The Settings sidebar provides:</p>
 
@@ -203,6 +232,7 @@
 <li>AP clients</li>
 <li>Wi-Fi RSSI</li>
 <li>Uptime</li>
+<li>Stream frame rate, or "no viewer"</li>
 <li>Firmware build date/time</li>
 <li>Latest debug message</li>
 <li>64-event retained event history</li>
@@ -212,6 +242,20 @@
 </ul>
 
 <p>Newest debug events are shown at the top.</p>
+
+<h2>Editing the web UI</h2>
+
+<p>The whole browser UI is one raw string literal, <code>INDEX_HTML</code>, inside <code>wdi_esp32_cam_robot_m1.ino</code>, so the sketch still opens in the Arduino IDE with no extra steps.</p>
+
+<p>That literal is about 70 KB, and it travels over the same Wi-Fi link as the video. The firmware therefore serves a gzipped copy of it -- about 15 KB -- which is generated into <code>index_html_gz.h</code> by:</p>
+
+<pre><code>python tools/gzip_ui.py</code></pre>
+
+<p>Run that after changing the HTML, CSS, or JavaScript, and commit the generated header alongside the sketch.</p>
+
+<p>If you forget, nothing breaks: the firmware compares the length and hash of the literal it was built with against the ones recorded in the header, and falls back to serving the page uncompressed. The debug log says so at boot:</p>
+
+<p><code>WARN: UI gzip asset is stale; serving N bytes uncompressed. Re-run tools/gzip_ui.py</code></p>
 
 <h2>UART0 / USB serial console</h2>
 
@@ -307,6 +351,7 @@ python -m http.server 8000
 <li>Wi-Fi connection state</li>
 <li>Fallback AP start</li>
 <li>Motor commands</li>
+<li>Motion timeout stops</li>
 <li>PWM changes</li>
 <li>Camera settings</li>
 <li>OTA start/success/failure</li>

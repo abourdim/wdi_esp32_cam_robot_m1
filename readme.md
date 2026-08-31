@@ -18,6 +18,28 @@ A Wi-Fi controlled ESP32-CAM robot with live camera streaming, independent motor
 - Forward, left, right, and stop controls.
 - Reverse is intentionally disabled because the present PCB uses one low-side MOSFET per motor rather than an H-bridge.
 
+### Hold to drive, and the motion timeout
+
+The direction buttons drive only while they are held. Because every command is
+a plain fire-and-forget request, any single one of them can be lost -- and the
+one that matters is the **stop**. A dropped stop used to leave a wheel turning
+until some later command happened to get through.
+
+So the robot no longer relies on hearing the stop:
+
+- A held button **repeats its command every 250 ms**.
+- If the robot hears no motion command for **600 ms**, it stops the motors
+  itself and logs `SAFETY: motion timeout; motors stopped`.
+- The release sends stop **twice**, 150 ms apart.
+- Losing window focus, hiding the tab, or leaving the page also stops.
+
+A lost packet, a closed laptop, a browser that never reported the release, or
+a robot that drives out of Wi-Fi range now all end the same way: the motors
+stop within about half a second.
+
+Keepalive repeats are not written to the event log -- several entries a second
+would bury everything else -- so a held button still shows as one command.
+
 At very low PWM values a motor may buzz without turning. This is useful for experiments because students can identify each motor's real starting threshold. Do not leave a stalled motor powered for long periods.
 
 ## Motor power hardware
@@ -36,6 +58,26 @@ For true bidirectional control, use an H-bridge such as a DRV8833 or TB6612FNG.
 ## Camera
 
 The ESP32-CAM serves an MJPEG stream on port **81**.
+
+### Video stream behavior
+
+- Defaults are **VGA at JPEG quality 12** with two frame buffers when PSRAM is
+  present, and **QVGA** when it is not. Quality 12 rather than 10 because the
+  Wi-Fi link, not the sensor, sets the frame rate.
+- The camera always hands over its **newest** frame. Queued frames would arrive
+  a capture late, which looks like lag even when the frame rate is fine.
+- Wi-Fi modem sleep is switched off. Left on, the radio parks between beacons
+  and the picture stutters.
+- **One viewer at a time.** A second browser is told the stream is in use
+  rather than being left with a picture that never arrives.
+- The page **reconnects on its own**. If the stream drops or simply stops --
+  a failed capture and a reboot both end it without any error the browser can
+  see -- the page notices within a few seconds and re-opens it. A short message
+  in the corner of the video says what is happening.
+- The stream **pauses while its browser tab is hidden**, so a forgotten tab
+  does not hold the single viewer slot or spend radio time on frames nobody is
+  watching. It resumes when the tab comes back.
+- The debug sidebar shows the frame rate the robot is actually sending.
 
 The Settings sidebar provides:
 
@@ -102,6 +144,7 @@ Shows:
 - AP clients
 - Wi-Fi RSSI
 - Uptime
+- Stream frame rate, or "no viewer"
 - Firmware build date/time
 - Latest debug message
 - 64-event retained event history
@@ -110,6 +153,29 @@ Shows:
 - Browser OTA firmware update
 
 Newest debug events are shown at the top.
+
+## Editing the web UI
+
+The whole browser UI is one raw string literal, `INDEX_HTML`, inside
+`wdi_esp32_cam_robot_m1.ino`, so the sketch still opens in the Arduino IDE with
+no extra steps.
+
+That literal is about 70 KB, and it travels over the same Wi-Fi link as the
+video. The firmware therefore serves a gzipped copy of it -- about 15 KB --
+which is generated into `index_html_gz.h` by:
+
+```bash
+python tools/gzip_ui.py
+```
+
+Run that after changing the HTML, CSS, or JavaScript, and commit the generated
+header alongside the sketch.
+
+If you forget, nothing breaks: the firmware compares the length and hash of the
+literal it was built with against the ones recorded in the header, and falls
+back to serving the page uncompressed. The debug log says so at boot:
+
+`WARN: UI gzip asset is stale; serving N bytes uncompressed. Re-run tools/gzip_ui.py`
 
 ## UART0 / USB serial console
 
@@ -194,6 +260,7 @@ Examples:
 - Wi-Fi connection state
 - Fallback AP start
 - Motor commands
+- Motion timeout stops
 - PWM changes
 - Camera settings
 - OTA start/success/failure
