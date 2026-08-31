@@ -112,12 +112,40 @@ static const int LED_MAX_PWM = 255;
 volatile int ledBrightness = 255;
 volatile bool ledEnabled = false;
 
-// Boot indicator: three short flashes at 5% of the 8-bit range. GPIO4 is the
-// module's own flash LED and is genuinely painful to look at near full scale,
-// which matters for something that fires on every boot.
-static const int LED_BOOT_BLINK_PWM = 13;  // 5% of 255
+// The flash LED runs on its own 12-bit LEDC channel instead of going through
+// analogWrite(). At 8-bit, half a percent of full scale is a single step, so a
+// dim pulse becomes an on/off stutter with no fade at all; 12 bits puts ~20
+// levels in that same span, which is enough to look smooth. The motors keep
+// using analogWrite at 8-bit -- only this one pin moves.
+//
+// Channel and timer are pinned explicitly rather than letting the HAL allocate,
+// because the camera driver holds LEDC_CHANNEL_0 / LEDC_TIMER_0 and a silent
+// collision there is not something to discover on the bench. Channel 7 maps to
+// timer 3.
+static const uint8_t LED_LEDC_CHANNEL = 7;
+static const uint8_t LED_LEDC_BITS = 12;
+static const uint32_t LED_LEDC_FREQ_HZ = 5000;
+static const int LED_LEDC_MAX = (1 << LED_LEDC_BITS) - 1;  // 4095
+
+// Boot indicator: three short flashes. GPIO4 is the module's own flash LED and
+// is painful to look at near full scale, which matters for something that
+// fires on every boot.
+static const float LED_BOOT_BLINK_PERCENT = 5.0f;
 static const int LED_BOOT_BLINK_COUNT = 3;
 static const int LED_BOOT_BLINK_MS = 120;
+
+// Heartbeat: one short pulse, repeated. The gap between pulses is what carries
+// the meaning -- a pulse a second when the configured Wi-Fi is joined, one
+// every five seconds when it is not (fallback AP, or still retrying). Rate
+// alone was a bad indicator: 1s against 3s of the same shape meant timing it
+// by eye. A pulse against four and a half seconds of dark does not.
+//
+// Peak is a percentage of full scale, deliberately, so it can be tuned in one
+// place without thinking about bit depth.
+static const float LED_HEARTBEAT_PEAK_PERCENT = 0.5f;
+static const uint32_t LED_HEARTBEAT_PULSE_MS = 450;
+static const uint32_t LED_HEARTBEAT_INTERVAL_LINKED_MS = 1000;
+static const uint32_t LED_HEARTBEAT_INTERVAL_UNLINKED_MS = 5000;
 
 // UART0 / USB-TTL console pins
 #define SERIAL_RX_PIN 3   // U0R
@@ -383,9 +411,72 @@ static int clampLedPWM(int value) {
   return value;
 }
 
+// Percentages of full scale, so brightness can be tuned without anyone having
+// to know the channel is 12-bit.
+static int ledDutyFromPercent(float percent) {
+  if (percent <= 0.0f) return 0;
+  if (percent >= 100.0f) return LED_LEDC_MAX;
+  return (int)lroundf((percent / 100.0f) * (float)LED_LEDC_MAX);
+}
+
 static void applyLedOutput() {
   int output = ledEnabled ? clampLedPWM(ledBrightness) : 0;
-  analogWrite(LED_GPIO_NUM, output);
+  // The UI still speaks 0-255; scale it onto the 12-bit channel the LED runs
+  // on now. Rounded rather than shifted so 255 lands exactly on full scale.
+  ledcWrite(LED_LEDC_CHANNEL, (int)lroundf((float)output * (float)LED_LEDC_MAX / (float)LED_MAX_PWM));
+}
+
+// Non-blocking status pulse; called every pass of loop().
+//
+// Yields the LED completely whenever the flash is switched on from the UI.
+// Someone who turned the light on wants light, not a status indicator winking
+// underneath their hand -- and applyLedOutput() has already written their
+// value, so returning here leaves it exactly as they set it. When they switch
+// it off again the pulse simply resumes on the next pass; no state to track.
+// "Linked" means somebody can reach the robot, by whichever route -- not that
+// it reached one particular router.
+//
+// Checking WL_CONNECTED alone was wrong for how this robot is actually used:
+// when the configured Wi-Fi is out of range or the credentials are off, it
+// falls back to its own AP, you connect your phone to that, and you drive it
+// perfectly well. Reporting "disconnected" through all of that is reporting on
+// the robot's disappointment rather than on anything the person holding the
+// phone cares about. On this build the fallback is the normal case, not the
+// exception.
+//
+// So the slow pulse now means what it should: nobody is there.
+static bool robotIsLinked() {
+  if (WiFi.status() == WL_CONNECTED) return true;
+  return WiFi.softAPgetStationNum() > 0;
+}
+
+static void serviceHeartbeat() {
+  if (ledEnabled) return;
+
+  const uint32_t interval = robotIsLinked()
+                              ? LED_HEARTBEAT_INTERVAL_LINKED_MS
+                              : LED_HEARTBEAT_INTERVAL_UNLINKED_MS;
+
+  // One fixed-length pulse per interval, then dark for the remainder. Fixing
+  // the pulse width rather than stretching it to fill the interval is the
+  // whole point: at five seconds a stretched shape is a barely-moving glow,
+  // where a 450ms pulse followed by four and a half seconds of nothing is
+  // unmistakable at a glance.
+  const uint32_t t = millis() % interval;
+  int duty = 0;
+  if (t < LED_HEARTBEAT_PULSE_MS) {
+    // Raised cosine: eases in and out of both ends and starts and finishes at
+    // exactly zero, so the pulse breathes rather than ticking on and off.
+    const float phase = (float)t / (float)LED_HEARTBEAT_PULSE_MS;
+    float shape = (1.0f - cosf(2.0f * (float)PI * phase)) * 0.5f;  // 0.0 .. 1.0
+    // Squared for gamma. Perceived brightness is nothing like duty cycle down
+    // here -- a linear ramp appears to leap off zero and then stall near the
+    // top. Squaring spends more of the ramp in the dim end, where the eye is
+    // actually looking.
+    shape *= shape;
+    duty = (int)lroundf(shape * (float)ledDutyFromPercent(LED_HEARTBEAT_PEAK_PERCENT));
+  }
+  ledcWrite(LED_LEDC_CHANNEL, duty);
 }
 
 static void writeMotors(int leftPWM, int rightPWM) {
@@ -679,7 +770,11 @@ void setup() {
 
   pinMode(MOTOR_L_PIN, OUTPUT);
   pinMode(MOTOR_R_PIN, OUTPUT);
-  pinMode(LED_GPIO_NUM, OUTPUT);
+
+  // The LED gets its own 12-bit LEDC channel; everything that writes GPIO4
+  // goes through ledcWrite() from here on, never analogWrite().
+  ledcSetup(LED_LEDC_CHANNEL, LED_LEDC_FREQ_HZ, LED_LEDC_BITS);
+  ledcAttachPin(LED_GPIO_NUM, LED_LEDC_CHANNEL);
 
   stopMotors();
   ledEnabled = false;
@@ -690,10 +785,11 @@ void setup() {
   // actually running. Worth having on a board whose only other way of saying
   // anything is a serial cable -- if the flashes appear, the ESP32 booted and
   // whatever comes next is a software problem rather than a dead board.
+  const int bootBlinkDuty = ledDutyFromPercent(LED_BOOT_BLINK_PERCENT);
   for (int i = 0; i < LED_BOOT_BLINK_COUNT; i++) {
-    analogWrite(LED_GPIO_NUM, LED_BOOT_BLINK_PWM);
+    ledcWrite(LED_LEDC_CHANNEL, bootBlinkDuty);
     delay(LED_BOOT_BLINK_MS);
-    analogWrite(LED_GPIO_NUM, 0);
+    ledcWrite(LED_LEDC_CHANNEL, 0);
     delay(LED_BOOT_BLINK_MS);
   }
   applyLedOutput();  // back to the configured state (off)
@@ -860,6 +956,10 @@ void loop() {
   if (!otaInProgress) {
     serviceWiFiFallback();
   }
+
+  // Outside the OTA guard on purpose: a firmware write is exactly when you
+  // most want to see that the board is still alive.
+  serviceHeartbeat();
 
   delay(10);
 }
