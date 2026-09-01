@@ -49,6 +49,7 @@
 
 #include "esp_camera.h"
 #include <WiFi.h>
+#include <DNSServer.h>
 #include "esp_timer.h"
 #include "img_converters.h"
 #include "Arduino.h"
@@ -131,6 +132,16 @@ volatile bool otaInProgress = false;
 
 char fallbackApSsid[32] = "";
 bool fallbackApActive = false;
+
+// Captive portal. Every DNS lookup made by a device joined to the fallback
+// AP is answered with the robot own address, so the phone or laptop decides
+// on its own that this network wants a sign-in page and opens one. That is
+// how a child reaches the robot without typing 192.168.4.1.
+//
+// It only ever runs while the fallback AP is up. On the configured network
+// the robot is a guest and has no business answering DNS.
+DNSServer dnsServer;
+bool captivePortalActive = false;
 unsigned long lastWiFiRetryMs = 0;
 static uint32_t wifiRetryIntervalMs = WIFI_RETRY_INTERVAL_MS;
 static bool wifiRetryPaused = false;
@@ -398,11 +409,30 @@ static bool startFallbackAccessPoint() {
   );
   setDebugMessage(dbg);
 
+  // NoError rather than a failure code: a device that gets an error for its
+  // connectivity check may decide the network is broken instead of captive.
+  dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
+  captivePortalActive = dnsServer.start(53, "*", apIp);
+
+  setDebugMessage(
+    captivePortalActive
+      ? "BOOT: Captive portal started; joining the AP opens the robot page"
+      : "WARN: Captive portal DNS could not start; open 192.168.4.1 by hand"
+  );
+
   // Re-start the station attempt after switching to AP+STA mode.
   WiFi.begin(ssid, password);
   lastWiFiRetryMs = millis();
 
   return true;
+}
+
+// Cheap enough to call every pass of loop(): with no query waiting this reads
+// an empty UDP socket and returns.
+static void serviceCaptivePortal() {
+  if (!captivePortalActive) return;
+
+  dnsServer.processNextRequest();
 }
 
 static void serviceWiFiFallback() {
@@ -1336,6 +1366,7 @@ void loop() {
 
   if (!otaInProgress) {
     serviceWiFiFallback();
+    serviceCaptivePortal();
   }
 
   // Outside the OTA guard on purpose: a firmware write is exactly when you
@@ -1828,6 +1859,14 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       background: rgba(255, 255, 255, 0.10);
     }
 
+    /* Settings and Debug open something and close again; this one stays on,
+       so it has to look different while it is. */
+    .hero-pill.is-on {
+      border-color: rgba(96, 165, 250, 0.55);
+      background: rgba(37, 99, 235, 0.30);
+      color: #eff6ff;
+    }
+
     .pill-icon {
       font-size: 15px;
       line-height: 1;
@@ -2042,6 +2081,74 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       max-height: none;
       transform-origin: center center;
       background: #111;
+    }
+
+    .follow-overlay {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform-origin: center center;
+      pointer-events: none;
+    }
+
+    /* The video takes a tap to choose a colour, but only while Follow is the
+       view being shown. */
+    .video-frame.is-picking {
+      cursor: crosshair;
+    }
+
+    .follow-pick {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+
+    .follow-swatch {
+      width: 30px;
+      height: 30px;
+      flex: none;
+      border: 2px solid #d7dce5;
+      border-radius: 8px;
+      background:
+        linear-gradient(45deg, #e5e7eb 25%, transparent 25%, transparent 75%, #e5e7eb 75%) 0 0/12px 12px,
+        linear-gradient(45deg, #e5e7eb 25%, transparent 25%, transparent 75%, #e5e7eb 75%) 6px 6px/12px 12px;
+    }
+
+    .follow-hint {
+      font-size: 13px;
+      line-height: 1.35;
+      color: #475569;
+    }
+
+    .follow-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 10px;
+      font-size: 13px;
+      font-weight: 700;
+      color: #334155;
+    }
+
+    .follow-row > span:first-child {
+      width: 118px;
+      flex: none;
+    }
+
+    .follow-row input[type="range"] {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .follow-check {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 12px;
+      font-size: 13px;
+      font-weight: 700;
+      color: #334155;
     }
 
     .panel {
@@ -2764,9 +2871,15 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
                 role="tab" aria-selected="true">Drive</button>
         <button id="tabProgram" class="hero-tab" type="button"
                 role="tab" aria-selected="false">Program</button>
+        <button id="tabFollow" class="hero-tab" type="button"
+                role="tab" aria-selected="false">Follow</button>
       </div>
 
       <div class="hero-right">
+        <button id="soundToggle" class="hero-pill" type="button"
+                aria-pressed="false"
+                title="Robot sounds"><span class="pill-icon">&#9834;</span><span class="pill-text">Sound</span></button>
+
         <button id="settingsToggle" class="hero-pill" type="button"
                 aria-controls="settingsSidebar" aria-expanded="false"
                 title="Open settings"><span class="pill-icon">⚙</span><span class="pill-text">Settings</span></button>
@@ -3139,7 +3252,12 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
 
   <div class="robot">
     <div id="videoFrame" class="video-frame">
-      <img src="" id="photo" alt="ESP32-CAM video stream">
+      <img src="" id="photo" crossorigin="anonymous" alt="ESP32-CAM video stream">
+
+      <!-- Sits on the image and carries the same rotation, because what it
+           draws is in image coordinates. Every other overlay deliberately
+           stays upright instead. -->
+      <canvas id="followOverlay" class="follow-overlay" hidden></canvas>
 
       <div id="streamStatus" class="stream-status" aria-live="polite"></div>
 
@@ -3316,6 +3434,49 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
         the moment you press Stop, leave this page, or switch away from it.
       </div>
     </div>
+
+    <div id="followView" class="panel" hidden>
+      <div class="program-head">
+        <strong>Follow a colour</strong>
+        <span id="followState" class="program-count">pick a colour</span>
+      </div>
+
+      <div class="follow-pick">
+        <span id="followSwatch" class="follow-swatch"></span>
+        <span class="follow-hint">
+          Tap the video on the thing you want the robot to follow.
+        </span>
+      </div>
+
+      <label class="follow-row">
+        <span>How fussy</span>
+        <input id="followTolerance" type="range" min="4" max="60" value="24">
+        <span id="followToleranceValue" class="slot-info">24</span>
+      </label>
+
+      <label class="follow-row">
+        <span>Close enough</span>
+        <input id="followArrive" type="range" min="2" max="40" value="12">
+        <span id="followArriveValue" class="slot-info">12%</span>
+      </label>
+
+      <label class="follow-check">
+        <input id="followReversed" type="checkbox">
+        <span>It turns the wrong way</span>
+      </label>
+
+      <div class="program-buttons">
+        <button id="followStart" class="program-action program-play" type="button" disabled>Follow</button>
+        <button id="followStopButton" class="program-action" type="button">Stop</button>
+      </div>
+
+      <div class="note">
+        The robot is not clever. It counts the pixels that match your colour,
+        turns towards the middle of them, and stops when they fill enough of
+        the picture. The box on the video is what it found: watch it settle on
+        a shadow instead, and you know why it drove the wrong way.
+      </div>
+    </div>
   </div>
 
   <div id="galleryModal" class="modal" hidden>
@@ -3361,6 +3522,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
   <script>
     const photo = document.getElementById("photo");
     const videoFrame = document.getElementById("videoFrame");
+    const followOverlay = document.getElementById("followOverlay");
     const leftSpeedSlider = document.getElementById("leftSpeedSlider");
     const rightSpeedSlider = document.getElementById("rightSpeedSlider");
     const leftSpeedValue = document.getElementById("leftSpeedValue");
@@ -3549,6 +3711,12 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
           "translate(-50%, -50%) rotate(" +
           cameraRotationDegrees +
           "deg)";
+
+        // The Follow box is drawn in image coordinates, so unlike every other
+        // overlay it has to turn with the image rather than stay upright.
+        followOverlay.style.width = photo.style.width;
+        followOverlay.style.height = photo.style.height;
+        followOverlay.style.transform = photo.style.transform;
       });
     }
 
@@ -3634,6 +3802,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     // it -- which is the point: if a command was lost, this corrects itself.
     function showLocalMotion(action) {
       setVideoMotion(action ? action.toUpperCase() : "STOP", Boolean(action));
+      robotSound.setMotion(action);
     }
 
     function applyTelemetry(data) {
@@ -3651,6 +3820,8 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
         videoMotion.classList.remove("is-moving");
         videoMotion.classList.add("is-timeout");
 
+        robotSound.timeout();
+
         setTimeout(() => {
           videoMotion.classList.remove("is-timeout");
           refreshTelemetryEmphasis();
@@ -3664,6 +3835,8 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
         moving ? (data.motion + " " + data.left + "/" + data.right) : "STOP",
         moving
       );
+
+      robotSound.setOutput(data.left, data.right, moving);
 
       refreshTelemetryEmphasis();
     }
@@ -4893,6 +5066,217 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       xhr.send(file);
     });
 
+    // ---- Robot sound ------------------------------------------------------
+    // The robot has no speaker. This is the tablet making the noise, which is
+    // why it can be an engine rather than a piezo and costs the ESP32 nothing.
+    //
+    // The pitch follows the PWM the motors are actually being given, so the
+    // number on the sliders becomes something a child can hear. Run one motor
+    // up slowly and the note climbs; the stretch where the note is rising and
+    // the wheel still is not turning is exactly the stiction that Settings ->
+    // Robot -> Measure them puts a number on.
+    //
+    // Off by default, and remembered per browser. Ten robots humming in one
+    // room is a teacher's problem, and switching it on is part of the lesson.
+
+    const robotSound = (function () {
+      // Low enough to sound like a motor rather than a test tone, and the
+      // range is wide enough that a 20-count difference is audible.
+      const ENGINE_MIN_HZ = 55;
+      const ENGINE_MAX_HZ = 210;
+      const ENGINE_LEVEL = 0.16;
+
+      // Long enough not to click, short enough to feel like the button.
+      const RAMP_S = 0.04;
+
+      let enabled = false;
+      let context = null;
+      let engineGain = null;
+      let engineOsc = null;
+      let running = false;
+
+      // A browser will not let a page make noise until the person has touched
+      // it, and a context created before that starts suspended. So it is
+      // built on the first gesture and resumed on every one after.
+      function ensureContext() {
+        if (context) return context;
+
+        const Ctor = window.AudioContext || window.webkitAudioContext;
+        if (!Ctor) return null;
+
+        try {
+          context = new Ctor();
+        } catch (error) {
+          return null;
+        }
+
+        engineOsc = context.createOscillator();
+        engineOsc.type = "sawtooth";
+        engineOsc.frequency.value = ENGINE_MIN_HZ;
+
+        // A raw sawtooth is a buzzer. Rolling the top off leaves something
+        // that reads as a motor under load.
+        const filter = context.createBiquadFilter();
+        filter.type = "lowpass";
+        filter.frequency.value = 760;
+
+        engineGain = context.createGain();
+        engineGain.gain.value = 0;
+
+        engineOsc.connect(filter);
+        filter.connect(engineGain);
+        engineGain.connect(context.destination);
+
+        // The oscillator runs for the life of the page; the gain is what
+        // starts and stops the sound. Oscillators cannot be restarted.
+        engineOsc.start();
+
+        return context;
+      }
+
+      function resume() {
+        if (!enabled) return;
+
+        const ctx = ensureContext();
+        if (ctx && ctx.state === "suspended") ctx.resume();
+      }
+
+      function pwmToHz(pwm) {
+        const value = Math.max(0, Math.min(255, Number(pwm) || 0));
+        return ENGINE_MIN_HZ + (ENGINE_MAX_HZ - ENGINE_MIN_HZ) * (value / 255);
+      }
+
+      // What the sliders are asking for. Used on press, because the robot own
+      // report of what it is doing is a poll away and the sound has to answer
+      // with the button.
+      function requestedPwm() {
+        const left = document.getElementById("leftSpeedSlider");
+        const right = document.getElementById("rightSpeedSlider");
+
+        return Math.max(
+          left ? Number(left.value) || 0 : 0,
+          right ? Number(right.value) || 0 : 0
+        );
+      }
+
+      function setEngine(on, pwm) {
+        if (!enabled) return;
+
+        const ctx = ensureContext();
+        if (!ctx) return;
+        if (ctx.state === "suspended") ctx.resume();
+
+        const now = ctx.currentTime;
+
+        engineOsc.frequency.cancelScheduledValues(now);
+        engineOsc.frequency.setTargetAtTime(pwmToHz(pwm), now, 0.05);
+
+        engineGain.gain.cancelScheduledValues(now);
+        engineGain.gain.setTargetAtTime(on ? ENGINE_LEVEL : 0, now, RAMP_S);
+
+        running = on;
+      }
+
+      // One-shot voices. Each builds its own nodes and lets them expire, so
+      // nothing has to be tracked or torn down.
+      function blip(startHz, endHz, seconds, level, type) {
+        if (!enabled) return;
+
+        const ctx = ensureContext();
+        if (!ctx) return;
+        if (ctx.state === "suspended") ctx.resume();
+
+        const now = ctx.currentTime;
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+
+        osc.type = type;
+        osc.frequency.setValueAtTime(startHz, now);
+        osc.frequency.exponentialRampToValueAtTime(endHz, now + seconds);
+
+        gain.gain.setValueAtTime(level, now);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + seconds);
+
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(now);
+        osc.stop(now + seconds);
+      }
+
+      return {
+        isEnabled: function () {
+          return enabled;
+        },
+
+        setEnabled: function (on) {
+          enabled = Boolean(on);
+
+          if (!enabled) {
+            // Silence now, not at the end of a ramp.
+            if (engineGain && context) {
+              engineGain.gain.cancelScheduledValues(context.currentTime);
+              engineGain.gain.value = 0;
+            }
+            running = false;
+            return;
+          }
+
+          resume();
+        },
+
+        resume: resume,
+
+        // Called the instant a button is pressed or released.
+        setMotion: function (action) {
+          setEngine(Boolean(action), requestedPwm());
+
+          if (!action) blip(420, 210, 0.09, 0.13, "square");
+        },
+
+        // The robot own view, a poll later. If a command was lost this is
+        // what corrects the sound, the same way it corrects the overlay.
+        setOutput: function (left, right, moving) {
+          if (!enabled) return;
+          if (!moving && !running) return;
+
+          setEngine(moving, Math.max(Number(left) || 0, Number(right) || 0));
+        },
+
+        // The dead man switch fired. Deliberately the ugliest sound here.
+        timeout: function () {
+          setEngine(false, 0);
+          blip(300, 70, 0.55, 0.22, "sawtooth");
+        }
+      };
+    })();
+
+    const soundToggle = document.getElementById("soundToggle");
+
+    function applySoundEnabled(on) {
+      robotSound.setEnabled(on);
+      soundToggle.classList.toggle("is-on", on);
+      soundToggle.setAttribute("aria-pressed", String(Boolean(on)));
+    }
+
+    soundToggle.addEventListener("click", () => {
+      // The click is itself the gesture the browser wants before a page may
+      // make noise, so switching it on here always works.
+      const next = !robotSound.isEnabled();
+
+      applySoundEnabled(next);
+      prefSet("Sound", next ? "1" : "0");
+
+      if (next) robotSound.setMotion(null);
+    });
+
+    // Off unless this browser was told otherwise.
+    applySoundEnabled(prefGet("Sound", "0") === "1");
+
+    // A context built in a previous session comes back suspended, and the
+    // first press of a drive button is the gesture that may resume it.
+    document.addEventListener("pointerdown", () => robotSound.resume());
+
+
     // ---- Hold-to-drive ---------------------------------------------------
     // Commands go out as fire-and-forget requests, so any one of them can be
     // lost. The robot therefore stops by itself if it hears nothing for
@@ -4955,6 +5339,10 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       button.addEventListener("pointerdown", (event) => {
         event.preventDefault();
 
+        // A hand on the controls takes the robot back: a follow that is
+        // steering it would otherwise fight the button for the wheels.
+        stopFollowing();
+
         // activeDriveAction is the single source of truth for "a button is
         // held", so the safety nets below can end a drive that this button
         // started without leaving it unable to start another one.
@@ -4990,18 +5378,31 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     // losing focus mid-press, the tab being hidden, the page going away.
     // A running program drives the robot exactly as a held button does, so
     // everything that ends a drive ends a replay too.
-    window.addEventListener("blur", () => { stopPlayback(); endDrive(); });
-    window.addEventListener("pagehide", () => { stopPlayback(); endDrive(); });
+    window.addEventListener("blur", () => {
+      stopFollowing();
+      stopPlayback();
+      endDrive();
+    });
+
+    window.addEventListener("pagehide", () => {
+      stopFollowing();
+      stopPlayback();
+      endDrive();
+    });
 
     document.addEventListener("visibilitychange", () => {
       if (document.hidden) {
+        stopFollowing();
         stopPlayback();
         endDrive();
       }
     });
 
+    // Stop means stop, whatever was doing the driving.
     stopButton.addEventListener("pointerdown", (event) => {
       event.preventDefault();
+      stopFollowing();
+      stopPlayback();
       clearDriveKeepalive();
       sendStopTwice();
     });
@@ -5016,8 +5417,10 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
 
     const tabDrive = document.getElementById("tabDrive");
     const tabProgram = document.getElementById("tabProgram");
+    const tabFollow = document.getElementById("tabFollow");
     const driveView = document.getElementById("driveView");
     const programView = document.getElementById("programView");
+    const followView = document.getElementById("followView");
     const recordButton = document.getElementById("recordButton");
     const recordLabel = document.getElementById("recordLabel");
     const programStatus = document.getElementById("programStatus");
@@ -5055,8 +5458,9 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
 
     function recordStep(step) {
       // A replay drives through these same functions; recording that would
-      // append the program to itself.
-      if (!recording || replaying) return;
+      // append the program to itself. Following does too, and those steps
+      // belong to the robot rather than to the child.
+      if (!recording || replaying || following) return;
       if (program.length >= PROGRAM_MAX_STEPS) return;
 
       const now = Date.now();
@@ -5361,25 +5765,378 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       });
     });
 
+    // ---- Follow a colour --------------------------------------------------
+    // The robot does not run this: the browser does. It already has the video,
+    // and it is a hundred times the computer the ESP32 is, so the frames never
+    // leave the tablet and the robot keeps doing the one thing it is good at.
+    //
+    // Steering goes out through beginDrive() and the same stop the Stop button
+    // sends, which means an autonomous drive gets the 250 ms keepalive and the
+    // 600 ms dead man's switch exactly like a held finger does. This cannot
+    // drive the robot in a way a child could not.
+
+    const followState = document.getElementById("followState");
+    const followSwatch = document.getElementById("followSwatch");
+    const followTolerance = document.getElementById("followTolerance");
+    const followToleranceValue = document.getElementById("followToleranceValue");
+    const followArrive = document.getElementById("followArrive");
+    const followArriveValue = document.getElementById("followArriveValue");
+    const followReversed = document.getElementById("followReversed");
+    const followStart = document.getElementById("followStart");
+    const followStopButton = document.getElementById("followStopButton");
+
+    // Small on purpose. Downscaling in the browser image path is a free blur,
+    // which is the cheapest noise filter there is, and 3072 pixels is nothing
+    // to walk eight times a second.
+    const FOLLOW_W = 64;
+    const FOLLOW_H = 48;
+
+    // Four canvas pixels per sampled pixel, so the box has clean edges.
+    const FOLLOW_OVERLAY_SCALE = 4;
+
+    const FOLLOW_TICK_MS = 125;
+
+    // Below this, a handful of stray pixels somewhere in the room would be
+    // enough to steer the robot.
+    const FOLLOW_MIN_PIXELS = 10;
+
+    // How far off centre the target may sit and still count as ahead. Too
+    // narrow and the robot hunts left and right without ever driving forward.
+    const FOLLOW_DEADBAND = 0.12;
+
+    // Long enough to survive a frame the target rolled out of, short enough
+    // that a robot which has genuinely lost it does not keep going.
+    const FOLLOW_LOST_MS = 1000;
+
+    const followCanvas = document.createElement("canvas");
+    followCanvas.width = FOLLOW_W;
+    followCanvas.height = FOLLOW_H;
+
+    const followCtx =
+      followCanvas.getContext("2d", { willReadFrequently: true });
+    const overlayCtx = followOverlay.getContext("2d");
+
+    followOverlay.width = FOLLOW_W * FOLLOW_OVERLAY_SCALE;
+    followOverlay.height = FOLLOW_H * FOLLOW_OVERLAY_SCALE;
+
+    let following = false;
+    let followTarget = null;
+    let followTimer = null;
+    let followAction = null;
+    let followLastSeenMs = 0;
+
+    function rgbToHsv(r, g, b) {
+      const rn = r / 255;
+      const gn = g / 255;
+      const bn = b / 255;
+
+      const max = Math.max(rn, gn, bn);
+      const min = Math.min(rn, gn, bn);
+      const span = max - min;
+
+      let h = 0;
+
+      if (span > 0) {
+        if (max === rn) h = 60 * (((gn - bn) / span) % 6);
+        else if (max === gn) h = 60 * ((bn - rn) / span + 2);
+        else h = 60 * ((rn - gn) / span + 4);
+      }
+
+      if (h < 0) h += 360;
+
+      return { h: h, s: max === 0 ? 0 : span / max, v: max };
+    }
+
+    // Hue is a circle, so red at 5 degrees and red at 355 are ten apart.
+    function hueDistance(a, b) {
+      const raw = Math.abs(a - b) % 360;
+      return raw > 180 ? 360 - raw : raw;
+    }
+
+    // A colour with almost no saturation has no meaningful hue: white, grey
+    // and black are all hue zero. A child who taps a white wall would
+    // otherwise get a robot that chases every pale thing in the room, so
+    // unsaturated targets are matched on brightness instead.
+    function followMatches(pixel, target, tolerance) {
+      if (target.s < 0.18) {
+        return pixel.s < 0.25 &&
+          Math.abs(pixel.v - target.v) < (tolerance / 100);
+      }
+
+      return pixel.s > 0.28 &&
+        pixel.v > 0.15 &&
+        hueDistance(pixel.h, target.h) <= tolerance;
+    }
+
+    function setFollowState(text) {
+      followState.textContent = text;
+    }
+
+    // The camera hands over raw sensor pixels. Turning a position in that
+    // frame into left or right for the robot means undoing what the sensor
+    // was told to do, and then applying how the camera is mounted, which is
+    // what the display rotation setting really records.
+    //
+    // Get this wrong and the robot steers away from the target, and everyone
+    // in the room blames the motors.
+    function frameXToRobotX(nx, ny) {
+      let ix = nx;
+      let iy = ny;
+
+      // Mirror and flip happen in the sensor, so the frame already carries
+      // them. Undo them to get back to what the lens is pointing at.
+      if (cameraHMirror.checked) ix = 1 - ix;
+      if (cameraVFlip.checked) iy = 1 - iy;
+
+      let robotX = ix;
+
+      if (cameraRotationDegrees === 90) robotX = 1 - iy;
+      else if (cameraRotationDegrees === 180) robotX = 1 - ix;
+      else if (cameraRotationDegrees === 270) robotX = iy;
+
+      // The escape hatch, for a mounting none of the above describes.
+      return followReversed.checked ? 1 - robotX : robotX;
+    }
+
+    // Everything the robot is told to do goes through here, and only when it
+    // changes: a held button repeats itself from the keepalive, and the
+    // firmware treats a repeat of the state it is already in as nothing.
+    function followDrive(action) {
+      if (action === followAction) return;
+
+      followAction = action;
+
+      if (action) {
+        beginDrive(action);
+      } else {
+        clearDriveKeepalive();
+        sendStopTwice();
+      }
+    }
+
+    function drawFollowBox(box) {
+      overlayCtx.clearRect(0, 0, followOverlay.width, followOverlay.height);
+
+      if (!box) return;
+
+      const k = FOLLOW_OVERLAY_SCALE;
+
+      overlayCtx.lineWidth = 3;
+      overlayCtx.strokeStyle = "#38bdf8";
+      overlayCtx.strokeRect(
+        box.minX * k,
+        box.minY * k,
+        (box.maxX - box.minX + 1) * k,
+        (box.maxY - box.minY + 1) * k
+      );
+    }
+
+    function followTick() {
+      if (!following || !followTarget) return;
+
+      // A multipart image has no frame at all until the first one lands.
+      if (!photo.naturalWidth) return;
+
+      let pixels;
+
+      try {
+        followCtx.drawImage(photo, 0, 0, FOLLOW_W, FOLLOW_H);
+        pixels = followCtx.getImageData(0, 0, FOLLOW_W, FOLLOW_H).data;
+      } catch (error) {
+        // The canvas is tainted: the stream arrived without the header that
+        // lets this page read it back. Nothing here can recover from that.
+        stopFollowing();
+        setFollowState("cannot read the video");
+        return;
+      }
+
+      const tolerance = Number(followTolerance.value);
+
+      let count = 0;
+      let sumX = 0;
+      let minX = FOLLOW_W;
+      let maxX = -1;
+      let minY = FOLLOW_H;
+      let maxY = -1;
+
+      for (let y = 0; y < FOLLOW_H; y++) {
+        for (let x = 0; x < FOLLOW_W; x++) {
+          const i = (y * FOLLOW_W + x) * 4;
+          const pixel = rgbToHsv(pixels[i], pixels[i + 1], pixels[i + 2]);
+
+          if (!followMatches(pixel, followTarget, tolerance)) continue;
+
+          count++;
+          sumX += x;
+
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+        }
+      }
+
+      if (count < FOLLOW_MIN_PIXELS) {
+        drawFollowBox(null);
+
+        // One missed frame is not lost. A second of them is.
+        if (Date.now() - followLastSeenMs > FOLLOW_LOST_MS) {
+          followDrive(null);
+          setFollowState("lost it");
+        }
+
+        return;
+      }
+
+      followLastSeenMs = Date.now();
+      drawFollowBox({ minX: minX, maxX: maxX, minY: minY, maxY: maxY });
+
+      const fraction = count / (FOLLOW_W * FOLLOW_H);
+      const arriveFraction = Number(followArrive.value) / 100;
+
+      if (fraction >= arriveFraction) {
+        followDrive(null);
+        setFollowState("close enough");
+        return;
+      }
+
+      const robotX = frameXToRobotX((sumX / count) / FOLLOW_W, 0.5);
+
+      if (robotX < 0.5 - FOLLOW_DEADBAND) {
+        followDrive("left");
+        setFollowState("turning left");
+      } else if (robotX > 0.5 + FOLLOW_DEADBAND) {
+        followDrive("right");
+        setFollowState("turning right");
+      } else {
+        followDrive("forward");
+        setFollowState("going for it");
+      }
+    }
+
+    function startFollowing() {
+      if (following || !followTarget) return;
+
+      // Two things driving the robot at once is one thing too many.
+      stopPlayback();
+
+      following = true;
+      followAction = null;
+      followLastSeenMs = Date.now();
+
+      followOverlay.hidden = false;
+      followStart.disabled = true;
+      setFollowState("looking");
+
+      clearInterval(followTimer);
+      followTimer = setInterval(followTick, FOLLOW_TICK_MS);
+    }
+
+    function stopFollowing() {
+      if (!following) return;
+
+      following = false;
+
+      clearInterval(followTimer);
+      followTimer = null;
+
+      // Whatever else happens, the robot stops.
+      followDrive(null);
+
+      followOverlay.hidden = true;
+      drawFollowBox(null);
+      followStart.disabled = !followTarget;
+      setFollowState("stopped");
+    }
+
+    // A tap on the video picks the colour. The frame is sampled unrotated, so
+    // the tap has to be un-rotated to land on the same pixel.
+    videoFrame.addEventListener("click", (event) => {
+      if (followView.hidden) return;
+      if (!photo.naturalWidth) return;
+
+      const rect = videoFrame.getBoundingClientRect();
+      const dx = event.clientX - (rect.left + rect.width / 2);
+      const dy = event.clientY - (rect.top + rect.height / 2);
+
+      const radians = -cameraRotationDegrees * Math.PI / 180;
+      const ux = dx * Math.cos(radians) - dy * Math.sin(radians);
+      const uy = dx * Math.sin(radians) + dy * Math.cos(radians);
+
+      // offsetWidth is the layout size, which the CSS rotation does not touch.
+      const nx = ux / photo.offsetWidth + 0.5;
+      const ny = uy / photo.offsetHeight + 0.5;
+
+      if (nx < 0 || nx > 1 || ny < 0 || ny > 1) return;
+
+      let sample;
+
+      try {
+        followCtx.drawImage(photo, 0, 0, FOLLOW_W, FOLLOW_H);
+        sample = followCtx.getImageData(
+          Math.min(FOLLOW_W - 1, Math.max(0, Math.floor(nx * FOLLOW_W))),
+          Math.min(FOLLOW_H - 1, Math.max(0, Math.floor(ny * FOLLOW_H))),
+          1,
+          1
+        ).data;
+      } catch (error) {
+        setFollowState("cannot read the video");
+        return;
+      }
+
+      followTarget = rgbToHsv(sample[0], sample[1], sample[2]);
+      followSwatch.style.background =
+        "rgb(" + sample[0] + "," + sample[1] + "," + sample[2] + ")";
+
+      followStart.disabled = following;
+      setFollowState(following ? "looking" : "ready");
+    });
+
+    followTolerance.addEventListener("input", () => {
+      followToleranceValue.textContent = followTolerance.value;
+    });
+
+    followArrive.addEventListener("input", () => {
+      followArriveValue.textContent = followArrive.value + "%";
+    });
+
+    followStart.addEventListener("click", startFollowing);
+    followStopButton.addEventListener("click", stopFollowing);
+
+
     // ---- Views ------------------------------------------------------------
     // The video stays above both views, so a program can be watched running.
 
     function showView(view) {
-      const wantsProgram = view === "program";
+      const wanted = (view === "program" || view === "follow") ? view : "drive";
 
-      driveView.hidden = wantsProgram;
-      programView.hidden = !wantsProgram;
+      // Leaving a view that can drive has to stop it driving. Both of these
+      // send a stop, so this cannot leave a wheel turning behind a hidden
+      // panel.
+      if (wanted !== "program") stopPlayback();
+      if (wanted !== "follow") stopFollowing();
 
-      tabDrive.classList.toggle("is-active", !wantsProgram);
-      tabProgram.classList.toggle("is-active", wantsProgram);
-      tabDrive.setAttribute("aria-selected", String(!wantsProgram));
-      tabProgram.setAttribute("aria-selected", String(wantsProgram));
+      driveView.hidden = wanted !== "drive";
+      programView.hidden = wanted !== "program";
+      followView.hidden = wanted !== "follow";
 
-      prefSet("View", view);
+      [[tabDrive, "drive"], [tabProgram, "program"], [tabFollow, "follow"]]
+        .forEach(([tab, name]) => {
+          const active = wanted === name;
+
+          tab.classList.toggle("is-active", active);
+          tab.setAttribute("aria-selected", String(active));
+        });
+
+      // Only the Follow view wants a tap on the video to mean something.
+      videoFrame.classList.toggle("is-picking", wanted === "follow");
+
+      prefSet("View", wanted);
     }
 
     tabDrive.addEventListener("click", () => showView("drive"));
     tabProgram.addEventListener("click", () => showView("program"));
+    tabFollow.addEventListener("click", () => showView("follow"));
 
 
     // ---- Robot identity and limits ---------------------------------------
@@ -5947,6 +6704,81 @@ static esp_err_t index_handler(httpd_req_t *req) {
   );
 }
 
+// ---- Captive portal landing page -------------------------------------------
+// Registered as the 404 handler, so it answers every address a device asks for
+// that is not one of ours -- which, with DNS pointed here, is every address in
+// the world. The operating system connectivity checks land here:
+//
+//   Android  http://connectivitycheck.gstatic.com/generate_204
+//   iOS      http://captive.apple.com/hotspot-detect.html
+//   Windows  http://www.msftconnecttest.com/connect
+//
+// Anything other than the 204 or the exact text those probes expect tells the
+// device the network is captive, and it offers to open a sign-in page.
+//
+// That sign-in page is a restricted mini-browser -- CustomTabs on Android --
+// where MJPEG and Web Serial behave badly. So this is a small landing page with
+// a link out, not a redirect to the robot UI: the link opens the real browser,
+// and the 70 KB page is never dragged through the probe.
+//
+// The markup uses single-quoted attributes so the whole page stays readable as
+// a C string literal.
+static esp_err_t portal_handler(httpd_req_t *req, httpd_err_code_t error) {
+  (void)error;
+
+  // Not a portal: a genuine 404 on the configured network should stay a 404.
+  if (!captivePortalActive) {
+    httpd_resp_set_status(req, "404 Not Found");
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_send(req, "Not found", HTTPD_RESP_USE_STRLEN);
+  }
+
+  IPAddress apIp = WiFi.softAPIP();
+  char url[32];
+  snprintf(url, sizeof(url), "http://%u.%u.%u.%u/",
+           apIp[0], apIp[1], apIp[2], apIp[3]);
+
+  httpd_resp_set_status(req, "200 OK");
+  httpd_resp_set_type(req, "text/html");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+  // Sent in chunks so the fixed markup never needs a buffer, and the only one
+  // left is small enough to hold a robot name and an address with room spare.
+  httpd_resp_sendstr_chunk(
+    req,
+    "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>Robot</title><style>"
+    "body{margin:0;min-height:100vh;display:flex;flex-direction:column;"
+    "align-items:center;justify-content:center;gap:18px;"
+    "font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;"
+    "text-align:center;padding:24px}"
+    "h1{margin:0;font-size:26px}p{margin:0;opacity:.7;font-size:15px}"
+    "a{display:inline-block;padding:16px 30px;border-radius:14px;"
+    "background:#2563eb;color:#fff;font-size:19px;text-decoration:none}"
+    "</style></head><body>"
+  );
+
+  char body[256];
+  snprintf(
+    body,
+    sizeof(body),
+    "<h1>%s</h1>"
+    "<a href='%s'>Open the robot</a>"
+    "<p>If nothing happens, open %s in your browser.</p>",
+    robotName,
+    url,
+    url
+  );
+
+  httpd_resp_sendstr_chunk(req, body);
+  httpd_resp_sendstr_chunk(req, "</body></html>");
+
+  // The socket must survive: an error handler that returns anything other than
+  // ESP_OK makes the server close the connection under the reply.
+  return httpd_resp_sendstr_chunk(req, NULL);
+}
+
 // A single still, on the control server, so it works while the stream server
 // is busy. The driver hands out the newest frame, so this is whatever the
 // camera is seeing right now.
@@ -6118,6 +6950,12 @@ static esp_err_t capture_handler(httpd_req_t *req) {
   httpd_resp_set_type(req, "image/jpeg");
   httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=robot.jpg");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  // The page is served from port 80 and this from port 81, which makes them
+  // different origins. Without this header the Follow view cannot read the
+  // pixels back out of the canvas it draws the video into -- the canvas is
+  // tainted and getImageData throws. The UI is compiled into this firmware,
+  // so the two can never disagree about whether the header is here.
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
   if (fb->format == PIXFORMAT_JPEG) {
     res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
@@ -6257,6 +7095,12 @@ static esp_err_t stream_handler(httpd_req_t *req) {
 
   if (res == ESP_OK) {
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    // The page is served from port 80 and this from port 81, which makes them
+    // different origins. Without this header the Follow view cannot read the
+    // pixels back out of the canvas it draws the video into -- the canvas is
+    // tainted and getImageData throws. The UI is compiled into this firmware,
+    // so the two can never disagree about whether the header is here.
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
   }
 
   // Frame rate is measured over a rolling one-second window.
@@ -7286,6 +8130,15 @@ void startCameraServer() {
     httpd_register_uri_handler(camera_httpd, &program_get_uri);
     httpd_register_uri_handler(camera_httpd, &program_post_uri);
     httpd_register_uri_handler(camera_httpd, &update_uri);
+
+    // Not a URI handler and so not counted against max_uri_handlers: this
+    // catches everything none of the above matched, which on the fallback
+    // AP is every site a joined device tries to reach.
+    httpd_register_err_handler(
+      camera_httpd,
+      HTTPD_404_NOT_FOUND,
+      portal_handler
+    );
   }
 
   config.server_port += 1;

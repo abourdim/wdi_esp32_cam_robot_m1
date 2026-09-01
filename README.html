@@ -274,7 +274,7 @@
 
 <h2>Record and replay</h2>
 
-<p>The header has two views of the same column, <strong>Drive</strong> and <strong>Program</strong>. The video stays above both, so a program can be watched while it runs.</p>
+<p>The header carries three views of the same column: <strong>Drive</strong>, <strong>Program</strong> and <strong>Follow</strong>. The video stays above all of them, so a program can be watched while it runs.</p>
 
 <p>Press <strong>Record</strong>, drive the robot by hand, press <strong>Stop</strong>. What you did is now a list of instructions in the Program view:</p>
 
@@ -294,6 +294,70 @@
 <p>It stops on <strong>Stop</strong>, on leaving the page, on switching tabs, and on the window losing focus. A replay that is interrupted always sends a stop.</p>
 
 <p>Repeats are not recorded as steps: a held button repeats itself four times a second and a dragged slider fires continuously, and neither is a new instruction.</p>
+
+<h2>Follow a colour</h2>
+
+<p>The third view in the header, beside Drive and Program. The robot drives itself towards something a child chose by tapping it on the video.</p>
+
+<ol>
+<li>Open <strong>Follow</strong>.</li>
+<li>Tap the video on the thing to follow -- a red ball, a blue cup. The swatch shows the colour that was picked up.</li>
+<li>Press <strong>Follow</strong>.</li>
+</ol>
+
+<p>The robot turns towards the colour, drives at it, and stops when it fills enough of the picture. A blue box on the video shows what it found.</p>
+
+<h3>It is not clever, and that is the lesson</h3>
+
+<p>Eight times a second the page draws the video into a 64x48 canvas, walks all 3072 pixels, and keeps the ones whose colour matches. It steers towards the middle of them:</p>
+
+<ul>
+<li>middle third of the frame -- forward</li>
+<li>left of that -- turn left</li>
+<li>right of that -- turn right</li>
+<li>enough matching pixels to fill <strong>Close enough</strong> -- stop</li>
+<li>nothing matching for a second -- stop, and the status reads <code>lost it</code></li>
+</ul>
+
+<p><strong>How fussy</strong> is how far a colour may be from the one picked and still count. Wide enough and a red ball and an orange chair are the same thing; narrow enough and a cloud passing the window loses the ball.</p>
+
+<p>The box is the point of the whole view. A child can watch the robot settle on a shadow, or on somebody's jumper, and see for themselves why it drove the wrong way. A robot that is right most of the time teaches much less.</p>
+
+<h3>Where the work happens</h3>
+
+<p>On the tablet, not on the robot. The browser already has the video and is a hundred times the computer the ESP32 is, so the frames never leave it and the robot is not asked to do anything new.</p>
+
+<p>Steering goes out through the same two functions a held finger uses. A follow therefore sends the same 250 ms keepalives and is governed by the same 600 ms motion timeout: <strong>it cannot drive the robot in a way a child could not.</strong></p>
+
+<p>It stops on <strong>Stop</strong>, on switching to another view, on touching any direction button, on leaving the page, on switching tabs, and on the window losing focus. Its steps are never written into a recorded program -- those are the robot's instructions, not the child's.</p>
+
+<h3>Why the stream carries a CORS header</h3>
+
+<p>The page is served from port 80 and the video from port 81, which makes them different origins. Without <code>Access-Control-Allow-Origin</code> on the stream, a canvas the video has been drawn into is <em>tainted</em> and the pixels cannot be read back out -- <code>getImageData</code> throws and Follow cannot work at all.</p>
+
+<p>The stream and capture handlers therefore send that header, and the <code>&lt;img&gt;</code> carries <code>crossorigin="anonymous"</code>. The browser UI is compiled into the firmware, so the two can never disagree about it.</p>
+
+<h3>If it turns the wrong way</h3>
+
+<p>Which way is "left" is not obvious to the software. Horizontal mirror and vertical flip happen inside the camera, so the frame already carries them, and the <strong>Display rotation</strong> setting is really a record of how the camera is mounted. Follow undoes the first two and then applies the third.</p>
+
+<p>If a mounting defeats all of that, tick <strong>It turns the wrong way</strong> and the steering is inverted. It is worth checking this before blaming a motor.</p>
+
+<h2>Robot sound</h2>
+
+<p>The <strong>Sound</strong> pill in the header. The robot has no speaker: this is the tablet making the noise, which is why it can be an engine rather than a beeper and costs the ESP32 nothing.</p>
+
+<ul>
+<li>An engine hum whose <strong>pitch follows the PWM</strong> the motors are being given.</li>
+<li>A short chirp on stop.</li>
+<li>A descending buzz when the motion timeout fires, alongside the red <code>TIMEOUT</code> on the video.</li>
+</ul>
+
+<p>The pitch is the reason it exists. Run one motor up slowly and the note climbs; the stretch where the note is clearly rising and the wheel still is not turning is exactly the stiction that <strong>Find the wake-up number</strong> puts a number on. A replayed program sounds like the drive that recorded it.</p>
+
+<p>Pressing a direction answers immediately from the slider values, and the robot's own report a poll later corrects it -- so a lost command is audible the same way it is visible.</p>
+
+<p><strong>Off by default</strong>, and remembered per browser. Ten robots humming in one room is a teacher's problem, and switching it on deliberately is part of the lesson. Browsers refuse to let a page make noise until somebody has touched it, so the first press is what starts it.</p>
 
 <h2>Photos</h2>
 
@@ -350,7 +414,7 @@
 
 <p>The whole browser UI is one raw string literal, <code>INDEX_HTML</code>, inside <code>wdi_esp32_cam_robot_m1.ino</code>, so the sketch still opens in the Arduino IDE with no extra steps.</p>
 
-<p>That literal is about 70 KB, and it travels over the same Wi-Fi link as the video. The firmware therefore serves a gzipped copy of it -- about 15 KB -- which is generated into <code>index_html_gz.h</code> by:</p>
+<p>That literal is about 170 KB, and it travels over the same Wi-Fi link as the video. The firmware therefore serves a gzipped copy of it -- about 40 KB -- which is generated into <code>index_html_gz.h</code> by:</p>
 
 <pre><code>python tools/gzip_ui.py</code></pre>
 
@@ -461,6 +525,26 @@ python -m http.server 8000
 </ul>
 
 <p><code>XXXX</code> is generated from part of the ESP32 chip ID so several classroom robots can have different SSIDs.</p>
+
+<h3>The captive portal</h3>
+
+<p>Nobody has to type <code>192.168.4.1</code>.</p>
+
+<p>While the fallback AP is up, the robot answers <strong>every</strong> DNS lookup with its own address. A phone or laptop that has just joined checks whether it can reach the internet, is answered by the robot instead, decides the network wants a sign-in, and opens a page by itself.</p>
+
+<p>That page is a small one -- the robot name and an <strong>Open the robot</strong> link -- rather than the robot UI. The sign-in browser an operating system opens is a restricted one (CustomTabs on Android), where the video stream and Web Serial both behave badly, so the link is there to get out of it into the real browser. It also means the 70 KB UI is never dragged through a connectivity check.</p>
+
+<p>Worth knowing:</p>
+
+<ul>
+<li><strong>Only on the fallback AP.</strong> On the configured network the robot is a guest and has no business answering DNS for anything. A genuine 404 there stays a 404.</li>
+<li>The robot provides no route to the internet, so a device joined to the AP will keep saying it has no connection. That is correct, and it is what makes the sign-in page appear.</li>
+<li>If the portal does not open on some device, nothing is lost: open <code>192.168.4.1</code> by hand, exactly as before.</li>
+</ul>
+
+<p>The boot log says which happened:</p>
+
+<p><code>BOOT: Captive portal started; joining the AP opens the robot page</code></p>
 
 <p>If normal Wi-Fi works, the robot is usually reached at the DHCP address shown in the debug sidebar or UART console.</p>
 
@@ -692,6 +776,9 @@ ESP32_Robot_Complete/
 <li>Compare Wi-Fi RSSI with stream smoothness.</li>
 <li>Compare motor behavior with wheels lifted versus robot on the floor.</li>
 <li>Add encoders/Hall sensors later and compare requested PWM with actual RPM.</li>
+<li>Switch Sound on and run one motor up slowly: find by ear the moment the note is rising but the wheel is not.</li>
+<li>Follow a coloured card, then move it near a wall the same colour and watch the box on the video decide the wall is the card.</li>
+<li>Change How fussy from one end to the other and find the setting that survives somebody walking past.</li>
 </ul>
 
 <h2>Future extensions</h2>
@@ -706,10 +793,19 @@ ESP32_Robot_Complete/
 <li>Closed-loop speed control</li>
 <li>Battery voltage monitoring</li>
 <li>H-bridge for reverse</li>
-<li>Saved Wi-Fi configuration from the browser</li>
 <li>Authentication for robot controls</li>
 <li>Downloadable CSV experiment data</li>
+<li>Line following, which is the Follow view with a brightness threshold on the bottom of the frame instead of a colour</li>
 </ul>
+
+<p>Two of those are further away than the rest, and it is worth saying why before anyone promises them to a class:</p>
+
+<ul>
+<li><strong>Battery voltage</strong> needs a spare ADC pin, and there is none. Every ADC1 pin (32 to 39) is taken by the camera, and ADC2 -- which is what would be left -- does not work while Wi-Fi is running. It needs an I2C ADC on the board.</li>
+<li><strong>Encoders</strong> have the same shortage: GPIO12 and GPIO13 are the motors, and almost nothing else on this module is free.</li>
+</ul>
+
+<p>Both want a hardware revision, not a firmware afternoon.</p>
 </main>
 </body>
 </html>
